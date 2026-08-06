@@ -8,6 +8,9 @@
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -20,6 +23,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
@@ -158,6 +162,41 @@ const GqlProcedureDefinition *GqlFindProcedure(const string &procedure_namespace
 		}
 	}
 	return nullptr;
+}
+
+static constexpr const char *GQL_ALGORITHM_METRICS_STATE_KEY = "gql_algorithm_metrics_state";
+
+struct GqlAlgorithmMetrics {
+	string graph_name;
+	string algorithm;
+	bool csr_built = false;
+	double csr_seconds = 0;
+	double initialization_seconds = 0;
+	double iteration_seconds = 0;
+	double output_seconds = 0;
+	double total_seconds = 0;
+	idx_t worker_count = 1;
+	idx_t vertex_count = 0;
+	idx_t edge_count = 0;
+	idx_t iterations = 0;
+	bool converged = false;
+};
+
+struct GqlAlgorithmMetricsState : ClientContextState {
+	unordered_map<string, shared_ptr<GqlAlgorithmMetrics>> latest;
+};
+
+static string AlgorithmMetricsKey(const string &graph_name, const string &algorithm) {
+	return StringUtil::Lower(graph_name) + "\n" + StringUtil::Lower(algorithm);
+}
+
+static double ElapsedSeconds(const std::chrono::steady_clock::time_point &start) {
+	return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+static void PublishAlgorithmMetrics(ClientContext &context, const shared_ptr<GqlAlgorithmMetrics> &metrics) {
+	auto state = context.registered_state->GetOrCreate<GqlAlgorithmMetricsState>(GQL_ALGORITHM_METRICS_STATE_KEY);
+	state->latest[AlgorithmMetricsKey(metrics->graph_name, metrics->algorithm)] = metrics;
 }
 
 enum class CsrDirection : uint8_t { OUT, IN, BOTH };
@@ -664,6 +703,7 @@ static unique_ptr<FunctionData> PageRankBind(ClientContext &, TableFunctionBindI
 struct PageRankState : GlobalTableFunctionState {
 	bool initialized = false;
 	shared_ptr<const GqlCsrSnapshot> snapshot;
+	shared_ptr<GqlAlgorithmMetrics> metrics;
 	vector<uint8_t> vertex_mask;
 	vector<double> ranks;
 	idx_t iterations = 0;
@@ -675,9 +715,94 @@ static unique_ptr<GlobalTableFunctionState> PageRankInit(ClientContext &, TableF
 	return make_uniq<PageRankState>();
 }
 
+static idx_t PageRankOutDegree(const GqlCsrSnapshot &snapshot, const vector<idx_t> &filtered_degrees, idx_t vertex) {
+	if (!filtered_degrees.empty()) {
+		return filtered_degrees[vertex];
+	}
+	if (snapshot.capabilities & GQL_CSR_OUTGOING) {
+		return NumericCast<idx_t>(snapshot.outgoing_offsets[vertex + 1] - snapshot.outgoing_offsets[vertex]);
+	}
+	return snapshot.outgoing_degrees[vertex];
+}
+
+struct alignas(64) PageRankTaskResult {
+	double difference = 0;
+	double dangling_rank = 0;
+};
+
+class PageRankPullTask : public BaseExecutorTask {
+public:
+	PageRankPullTask(TaskExecutor &executor, const GqlCsrSnapshot &snapshot, const vector<uint8_t> &vertex_mask,
+	                 const vector<idx_t> &filtered_degrees, const vector<double> &ranks, vector<double> &next,
+	                 idx_t begin, idx_t end, bool filter_label, uint32_t required_label, double damping, double base,
+	                 PageRankTaskResult &result)
+	    : BaseExecutorTask(executor), snapshot(snapshot), vertex_mask(vertex_mask), filtered_degrees(filtered_degrees),
+	      ranks(ranks), next(next), begin(begin), end(end), filter_label(filter_label), required_label(required_label),
+	      damping(damping), base(base), result(result) {
+	}
+
+	void ExecuteTask() override {
+		for (idx_t target = begin; target < end; target++) {
+			if (!InVertexProjection(vertex_mask, target)) {
+				next[target] = 0;
+				continue;
+			}
+			double rank = base;
+			for (idx_t edge = snapshot.incoming_offsets[target]; edge < snapshot.incoming_offsets[target + 1]; edge++) {
+				if (filter_label && snapshot.incoming_label_ids[edge] != required_label) {
+					continue;
+				}
+				auto source = snapshot.incoming_neighbors[edge];
+				if (!InVertexProjection(vertex_mask, source)) {
+					continue;
+				}
+				auto degree = PageRankOutDegree(snapshot, filtered_degrees, source);
+				D_ASSERT(degree > 0);
+				rank += damping * ranks[source] / static_cast<double>(degree);
+			}
+			next[target] = rank;
+			result.difference += std::abs(rank - ranks[target]);
+			if (PageRankOutDegree(snapshot, filtered_degrees, target) == 0) {
+				result.dangling_rank += rank;
+			}
+		}
+	}
+
+	string TaskType() const override {
+		return "PageRankPullTask";
+	}
+
+private:
+	const GqlCsrSnapshot &snapshot;
+	const vector<uint8_t> &vertex_mask;
+	const vector<idx_t> &filtered_degrees;
+	const vector<double> &ranks;
+	vector<double> &next;
+	idx_t begin;
+	idx_t end;
+	bool filter_label;
+	uint32_t required_label;
+	double damping;
+	double base;
+	PageRankTaskResult &result;
+};
+
 static void ComputePageRank(ClientContext &context, const PageRankBindData &data, PageRankState &state) {
-	state.snapshot = GqlGetOrBuildCsrSnapshot(
-	    context, data.graph_name, AlgorithmCsrCapabilities(CsrDirection::OUT, data.edge_label, data.vertex_label));
+	auto total_start = std::chrono::steady_clock::now();
+	state.metrics = make_shared_ptr<GqlAlgorithmMetrics>();
+	state.metrics->graph_name = data.graph_name;
+	state.metrics->algorithm = "pagerank";
+	auto csr_start = std::chrono::steady_clock::now();
+	auto available_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	auto capabilities =
+	    available_threads == 1
+	        ? AlgorithmCsrCapabilities(CsrDirection::OUT, data.edge_label, data.vertex_label)
+	        : AlgorithmCsrCapabilities(CsrDirection::IN, data.edge_label, data.vertex_label) | GQL_CSR_OUT_DEGREES;
+	state.snapshot = GqlGetOrBuildCsrSnapshot(context, data.graph_name, capabilities, &state.metrics->csr_built);
+	state.metrics->csr_seconds = ElapsedSeconds(csr_start);
+	state.metrics->vertex_count = state.snapshot->vertex_ids.size();
+	state.metrics->edge_count = state.snapshot->edge_count;
+	auto initialization_start = std::chrono::steady_clock::now();
 	const auto vertex_count = state.snapshot->vertex_ids.size();
 	idx_t projected_count;
 	state.vertex_mask = BuildVertexMask(*state.snapshot, data.vertex_label, projected_count);
@@ -685,73 +810,127 @@ static void ComputePageRank(ClientContext &context, const PageRankBindData &data
 	if (projected_count == 0) {
 		state.converged = true;
 		state.initialized = true;
+		state.metrics->converged = true;
+		state.metrics->initialization_seconds = ElapsedSeconds(initialization_start);
+		state.metrics->total_seconds = ElapsedSeconds(total_start);
+		PublishAlgorithmMetrics(context, state.metrics);
 		return;
 	}
 	bool filter_label;
 	auto required_label = ResolveLabel(*state.snapshot, data.edge_label, filter_label);
-	vector<idx_t> out_degrees(vertex_count, 0);
-	for (idx_t source = 0; source < vertex_count; source++) {
-		if (!InVertexProjection(state.vertex_mask, source)) {
-			continue;
-		}
-		if (state.vertex_mask.empty() && !filter_label) {
-			out_degrees[source] =
-			    state.snapshot->outgoing_offsets[source + 1] - state.snapshot->outgoing_offsets[source];
-			continue;
-		}
-		for (idx_t offset = state.snapshot->outgoing_offsets[source];
-		     offset < state.snapshot->outgoing_offsets[source + 1]; offset++) {
-			auto target = state.snapshot->outgoing_neighbors[offset];
-			out_degrees[source] += InVertexProjection(state.vertex_mask, target) &&
-			                       (!filter_label || state.snapshot->outgoing_label_ids[offset] == required_label);
+	vector<idx_t> filtered_degrees;
+	if (!state.vertex_mask.empty() || filter_label) {
+		filtered_degrees.assign(vertex_count, 0);
+		if (state.snapshot->capabilities & GQL_CSR_INCOMING) {
+			for (idx_t target = 0; target < vertex_count; target++) {
+				if (!InVertexProjection(state.vertex_mask, target)) {
+					continue;
+				}
+				for (idx_t edge = state.snapshot->incoming_offsets[target];
+				     edge < state.snapshot->incoming_offsets[target + 1]; edge++) {
+					if (filter_label && state.snapshot->incoming_label_ids[edge] != required_label) {
+						continue;
+					}
+					auto source = state.snapshot->incoming_neighbors[edge];
+					if (InVertexProjection(state.vertex_mask, source)) {
+						filtered_degrees[source]++;
+					}
+				}
+			}
+		} else {
+			for (idx_t source = 0; source < vertex_count; source++) {
+				if (!InVertexProjection(state.vertex_mask, source)) {
+					continue;
+				}
+				for (idx_t edge = state.snapshot->outgoing_offsets[source];
+				     edge < state.snapshot->outgoing_offsets[source + 1]; edge++) {
+					auto target = state.snapshot->outgoing_neighbors[edge];
+					filtered_degrees[source] +=
+					    InVertexProjection(state.vertex_mask, target) &&
+					    (!filter_label || state.snapshot->outgoing_label_ids[edge] == required_label);
+				}
+			}
 		}
 	}
 
+	double dangling_rank = 0;
 	for (idx_t vertex = 0; vertex < vertex_count; vertex++) {
 		if (InVertexProjection(state.vertex_mask, vertex)) {
 			state.ranks[vertex] = 1.0 / static_cast<double>(projected_count);
+			if (PageRankOutDegree(*state.snapshot, filtered_degrees, vertex) == 0) {
+				dangling_rank += state.ranks[vertex];
+			}
 		}
 	}
+	auto task_count = vertex_count < 32768 ? idx_t(1) : MinValue<idx_t>(available_threads, vertex_count);
+	state.metrics->worker_count = MaxValue<idx_t>(task_count, 1);
+	state.metrics->initialization_seconds = ElapsedSeconds(initialization_start);
 	vector<double> next(vertex_count, 0.0);
+	vector<PageRankTaskResult> task_results(state.metrics->worker_count);
+	auto iteration_start = std::chrono::steady_clock::now();
 	for (idx_t iteration = 1; iteration <= data.max_iterations; iteration++) {
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
-		double dangling_rank = 0.0;
-		for (idx_t source = 0; source < vertex_count; source++) {
-			if (InVertexProjection(state.vertex_mask, source) && out_degrees[source] == 0) {
-				dangling_rank += state.ranks[source];
-			}
-		}
 		auto base = (1.0 - data.damping) / static_cast<double>(projected_count) +
 		            data.damping * dangling_rank / static_cast<double>(projected_count);
-		std::fill(next.begin(), next.end(), 0.0);
-		for (idx_t vertex = 0; vertex < vertex_count; vertex++) {
-			if (InVertexProjection(state.vertex_mask, vertex)) {
-				next[vertex] = base;
-			}
+		for (auto &result : task_results) {
+			result = PageRankTaskResult();
 		}
-		for (idx_t source = 0; source < vertex_count; source++) {
-			if (out_degrees[source] == 0) {
-				continue;
+		if (state.metrics->worker_count == 1 && (state.snapshot->capabilities & GQL_CSR_OUTGOING)) {
+			std::fill(next.begin(), next.end(), 0.0);
+			for (idx_t vertex = 0; vertex < vertex_count; vertex++) {
+				if (InVertexProjection(state.vertex_mask, vertex)) {
+					next[vertex] = base;
+				}
 			}
-			auto contribution = data.damping * state.ranks[source] / static_cast<double>(out_degrees[source]);
-			for (idx_t offset = state.snapshot->outgoing_offsets[source];
-			     offset < state.snapshot->outgoing_offsets[source + 1]; offset++) {
-				if (filter_label && state.snapshot->outgoing_label_ids[offset] != required_label) {
+			for (idx_t source = 0; source < vertex_count; source++) {
+				auto degree = PageRankOutDegree(*state.snapshot, filtered_degrees, source);
+				if (degree == 0) {
 					continue;
 				}
-				auto target = state.snapshot->outgoing_neighbors[offset];
-				if (InVertexProjection(state.vertex_mask, target)) {
-					next[target] += contribution;
+				auto contribution = data.damping * state.ranks[source] / static_cast<double>(degree);
+				for (idx_t edge = state.snapshot->outgoing_offsets[source];
+				     edge < state.snapshot->outgoing_offsets[source + 1]; edge++) {
+					if (filter_label && state.snapshot->outgoing_label_ids[edge] != required_label) {
+						continue;
+					}
+					auto target = state.snapshot->outgoing_neighbors[edge];
+					if (InVertexProjection(state.vertex_mask, target)) {
+						next[target] += contribution;
+					}
 				}
 			}
-		}
-		double difference = 0.0;
-		for (idx_t vertex = 0; vertex < vertex_count; vertex++) {
-			if (InVertexProjection(state.vertex_mask, vertex)) {
-				difference += std::abs(next[vertex] - state.ranks[vertex]);
+			for (idx_t vertex = 0; vertex < vertex_count; vertex++) {
+				if (!InVertexProjection(state.vertex_mask, vertex)) {
+					continue;
+				}
+				task_results[0].difference += std::abs(next[vertex] - state.ranks[vertex]);
+				if (PageRankOutDegree(*state.snapshot, filtered_degrees, vertex) == 0) {
+					task_results[0].dangling_rank += next[vertex];
+				}
 			}
+		} else if (state.metrics->worker_count == 1) {
+			TaskExecutor executor(context);
+			PageRankPullTask task(executor, *state.snapshot, state.vertex_mask, filtered_degrees, state.ranks, next, 0,
+			                      vertex_count, filter_label, required_label, data.damping, base, task_results[0]);
+			task.ExecuteTask();
+		} else {
+			TaskExecutor executor(context);
+			for (idx_t task_index = 0; task_index < state.metrics->worker_count; task_index++) {
+				auto begin = vertex_count * task_index / state.metrics->worker_count;
+				auto end = vertex_count * (task_index + 1) / state.metrics->worker_count;
+				executor.ScheduleTask(make_uniq<PageRankPullTask>(
+				    executor, *state.snapshot, state.vertex_mask, filtered_degrees, state.ranks, next, begin, end,
+				    filter_label, required_label, data.damping, base, task_results[task_index]));
+			}
+			executor.WorkOnTasks();
+		}
+		double difference = 0;
+		dangling_rank = 0;
+		for (const auto &result : task_results) {
+			difference += result.difference;
+			dangling_rank += result.dangling_rank;
 		}
 		state.ranks.swap(next);
 		state.iterations = iteration;
@@ -760,7 +939,12 @@ static void ComputePageRank(ClientContext &context, const PageRankBindData &data
 			break;
 		}
 	}
+	state.metrics->iteration_seconds = ElapsedSeconds(iteration_start);
+	state.metrics->iterations = state.iterations;
+	state.metrics->converged = state.converged;
+	state.metrics->total_seconds = ElapsedSeconds(total_start);
 	state.initialized = true;
+	PublishAlgorithmMetrics(context, state.metrics);
 }
 
 static void PageRankFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -769,6 +953,7 @@ static void PageRankFunction(ClientContext &context, TableFunctionInput &input, 
 	if (!state.initialized) {
 		ComputePageRank(context, data, state);
 	}
+	auto output_start = std::chrono::steady_clock::now();
 	auto vertex_ids = FlatVector::GetData<uint64_t>(output.data[0]);
 	auto ranks = FlatVector::GetData<double>(output.data[1]);
 	auto iterations = FlatVector::GetData<uint64_t>(output.data[2]);
@@ -786,6 +971,9 @@ static void PageRankFunction(ClientContext &context, TableFunctionInput &input, 
 		count++;
 	}
 	output.SetCardinality(count);
+	state.metrics->output_seconds += ElapsedSeconds(output_start);
+	state.metrics->total_seconds = state.metrics->csr_seconds + state.metrics->initialization_seconds +
+	                               state.metrics->iteration_seconds + state.metrics->output_seconds;
 }
 
 struct GraphAlgorithmBindData : TableFunctionData {
@@ -2753,6 +2941,79 @@ TableFunction GqlClosenessFunction() {
 	function.init_global = ClosenessInit;
 	function.named_parameters["direction"] = LogicalType::VARCHAR;
 	AddProjectionParameters(function);
+	return function;
+}
+
+struct AlgorithmStatsBindData : TableFunctionData {
+	string graph_name;
+	string algorithm;
+};
+
+struct AlgorithmStatsState : GlobalTableFunctionState {
+	shared_ptr<GqlAlgorithmMetrics> metrics;
+	bool done = false;
+};
+
+static unique_ptr<FunctionData> AlgorithmStatsBind(ClientContext &, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<AlgorithmStatsBindData>();
+	result->graph_name = input.inputs[0].GetValue<string>();
+	result->algorithm = StringUtil::Lower(input.inputs[1].GetValue<string>());
+	if (result->graph_name.empty() || result->algorithm.empty()) {
+		throw BinderException("GQL algorithm stats requires a graph name and algorithm name");
+	}
+	names = {"graph_name",             "algorithm",         "csr_built",       "csr_seconds",
+	         "initialization_seconds", "iteration_seconds", "output_seconds",  "total_seconds",
+	         "worker_count",           "vertex_count",      "edge_count",      "iterations",
+	         "converged"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,
+	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                LogicalType::BOOLEAN};
+	return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> AlgorithmStatsInit(ClientContext &context,
+                                                               TableFunctionInitInput &input) {
+	auto &data = input.bind_data->Cast<AlgorithmStatsBindData>();
+	auto result = make_uniq<AlgorithmStatsState>();
+	auto metrics_state =
+	    context.registered_state->GetOrCreate<GqlAlgorithmMetricsState>(GQL_ALGORITHM_METRICS_STATE_KEY);
+	auto entry = metrics_state->latest.find(AlgorithmMetricsKey(data.graph_name, data.algorithm));
+	if (entry != metrics_state->latest.end()) {
+		result->metrics = entry->second;
+	}
+	return std::move(result);
+}
+
+static void AlgorithmStatsFunction(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<AlgorithmStatsState>();
+	if (state.done || !state.metrics) {
+		return;
+	}
+	auto &metrics = *state.metrics;
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value(metrics.graph_name));
+	output.SetValue(1, 0, Value(metrics.algorithm));
+	output.SetValue(2, 0, Value::BOOLEAN(metrics.csr_built));
+	output.SetValue(3, 0, Value(metrics.csr_seconds));
+	output.SetValue(4, 0, Value(metrics.initialization_seconds));
+	output.SetValue(5, 0, Value(metrics.iteration_seconds));
+	output.SetValue(6, 0, Value(metrics.output_seconds));
+	output.SetValue(7, 0, Value(metrics.total_seconds));
+	output.SetValue(8, 0, Value::UBIGINT(metrics.worker_count));
+	output.SetValue(9, 0, Value::UBIGINT(metrics.vertex_count));
+	output.SetValue(10, 0, Value::UBIGINT(metrics.edge_count));
+	output.SetValue(11, 0, Value::UBIGINT(metrics.iterations));
+	output.SetValue(12, 0, Value::BOOLEAN(metrics.converged));
+	state.done = true;
+}
+
+TableFunction GqlAlgorithmStatsFunction() {
+	TableFunction function("gql_algorithm_stats", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                       AlgorithmStatsFunction);
+	function.bind = AlgorithmStatsBind;
+	function.init_global = AlgorithmStatsInit;
 	return function;
 }
 

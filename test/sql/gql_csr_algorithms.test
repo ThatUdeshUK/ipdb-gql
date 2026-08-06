@@ -759,7 +759,8 @@ direction must be 'out', 'in', or 'both'
 
 # Conservative graph-version invalidation rejects stale snapshots internally.
 # The next algorithm rebuilds its required projection automatically. Unfiltered
-# PageRank needs outgoing topology but no edge identity or label arrays.
+# PageRank needs incoming topology plus compact outgoing degrees, but no edge
+# identity or label arrays.
 statement ok
 MATCH (n:node) SET n.name = n.name
 
@@ -768,11 +769,32 @@ SELECT count(*) FROM system.algo.pagerank('algo_graph')
 ----
 6
 
-query IIIII
-SELECT has_outgoing, has_incoming, has_edge_ids, has_edge_labels, has_vertex_labels
+query IIIIII
+SELECT has_outgoing, has_incoming, has_edge_ids, has_edge_labels, has_vertex_labels, has_out_degrees
 FROM gql_csr_stats('algo_graph')
 ----
-true	false	false	false	false
+false	true	false	false	false	true
+
+query IIIIIIIIII
+SELECT csr_built, csr_seconds >= 0, initialization_seconds >= 0, iteration_seconds > 0,
+       total_seconds >= iteration_seconds, worker_count >= 1, vertex_count, edge_count,
+       iterations > 0, converged
+FROM gql_algorithm_stats('algo_graph', 'pagerank')
+----
+true	true	true	true	true	true	6	9	true	true
+
+# A second PageRank reuses the compatible algorithm-owned CSR and records that
+# distinction independently of wall-clock query timing.
+query I
+SELECT count(*) FROM system.algo.pagerank('algo_graph')
+----
+6
+
+query II
+SELECT csr_built, worker_count >= 1
+FROM gql_algorithm_stats('algo_graph', 'pagerank')
+----
+false	true
 
 query I
 SELECT count(*) FROM system.algo.bfs('algo_graph', 1)

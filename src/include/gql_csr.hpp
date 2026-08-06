@@ -20,6 +20,7 @@ enum GqlCsrCapability : GqlCsrCapabilities {
 	GQL_CSR_VERTEX_LABELS = 1U << 4U,
 	GQL_CSR_VERTEX_LABEL_POSTINGS = 1U << 5U,
 	GQL_CSR_EDGE_STATS = 1U << 6U,
+	GQL_CSR_OUT_DEGREES = 1U << 7U,
 };
 
 static constexpr GqlCsrCapabilities GQL_CSR_FULL = GQL_CSR_OUTGOING | GQL_CSR_INCOMING | GQL_CSR_EDGE_IDS |
@@ -200,6 +201,7 @@ struct GqlCsrSnapshot {
 	vector<uint64_t> vertex_label_posting_offsets;
 	GqlCsrOrdinals vertex_label_postings;
 	vector<uint64_t> outgoing_offsets;
+	GqlCsrOrdinals outgoing_degrees;
 	GqlCsrOrdinals outgoing_neighbors;
 	vector<uint64_t> outgoing_edge_ids;
 	GqlCsrEdgeLabels outgoing_label_ids;
@@ -225,7 +227,7 @@ shared_ptr<const GqlCsrSnapshot> GqlGetCsrSnapshot(ClientContext &context, const
 //! Return a current capability-compatible snapshot, building it automatically
 //! when the calling algorithm has not prepared one on this connection yet.
 shared_ptr<const GqlCsrSnapshot> GqlGetOrBuildCsrSnapshot(ClientContext &context, const string &graph_name,
-                                                          GqlCsrCapabilities capabilities);
+                                                          GqlCsrCapabilities capabilities, bool *built = nullptr);
 
 //! Returns a current connection-local snapshot when one is available and
 //! valid. Unlike GqlGetCsrSnapshot, this is a non-throwing optimizer probe.

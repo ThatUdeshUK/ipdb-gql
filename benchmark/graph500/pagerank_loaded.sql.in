@@ -17,6 +17,12 @@ FROM system.algo.pagerank(
     tolerance := 1e-8
 );
 
+.print phase=metrics_cold
+SELECT 'algorithm_metrics_cold', csr_built, csr_seconds, initialization_seconds,
+       iteration_seconds, output_seconds, total_seconds, worker_count,
+       vertex_count, edge_count, iterations, converged
+FROM gql_algorithm_stats('graph500', 'pagerank');
+
 .print phase=csr_stats
 SELECT vertex_count, edge_count, memory_bytes
 FROM gql_csr_stats('graph500');
@@ -31,3 +37,9 @@ FROM system.algo.pagerank(
     max_iterations := 100,
     tolerance := 1e-8
 );
+
+.print phase=metrics_warm
+SELECT 'algorithm_metrics_warm', csr_built, csr_seconds, initialization_seconds,
+       iteration_seconds, output_seconds, total_seconds, worker_count,
+       vertex_count, edge_count, iterations, converged
+FROM gql_algorithm_stats('graph500', 'pagerank');

@@ -2,10 +2,12 @@
 
 The runner downloads the official Graph500 Kronecker generator, compiles a
 streaming CSV adapter, imports each requested scale into DuckGQL, and runs
-PageRank to convergence. PageRank automatically builds an outgoing-only CSR
-projection without edge IDs, labels, incoming topology, or label postings. The
-runner records one cold CSR-plus-PageRank execution followed by one warm
-PageRank execution over the cached projection.
+PageRank to convergence. PageRank automatically builds an incoming-only CSR
+projection plus compact outgoing degrees, without edge IDs, labels, outgoing
+neighbors, or label postings. The runner records one cold CSR-plus-PageRank
+execution followed by one warm PageRank execution over the cached projection.
+It also records extension-internal CSR, initialization, iteration, output, and
+worker-count metrics for both executions.
 
 Start with one moderate scale:
 
@@ -42,3 +44,6 @@ unless <code>--regenerate</code> or <code>--reimport</code> is passed.
 The official generator's tuple orientation is treated as directed by DuckGQL
 PageRank. The runner does not symmetrize edges and is not an official Graph500
 submission.
+
+The measured implementation and scale results are described in
+[`PERFORMANCE.md`](PERFORMANCE.md).

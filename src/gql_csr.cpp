@@ -186,6 +186,12 @@ static idx_t LabelDictionaryStorageBytes(const unordered_map<string, uint32_t> &
 }
 
 static bool CsrHasCapabilities(GqlCsrCapabilities available, GqlCsrCapabilities required) {
+	// A materialized outgoing CSR already contains the exact out-degree in its
+	// offset differences, so it can satisfy an algorithm asking only for the
+	// compact degree sidecar.
+	if (available & GQL_CSR_OUTGOING) {
+		required &= ~GQL_CSR_OUT_DEGREES;
+	}
 	return (available & required) == required;
 }
 
@@ -212,6 +218,7 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 	const bool build_vertex_labels = capabilities & GQL_CSR_VERTEX_LABELS;
 	const bool build_vertex_label_postings = capabilities & GQL_CSR_VERTEX_LABEL_POSTINGS;
 	const bool build_edge_stats = capabilities & GQL_CSR_EDGE_STATS;
+	const bool build_out_degrees = capabilities & GQL_CSR_OUT_DEGREES;
 	GqlTableGraphBinding binding;
 	if (!GqlTryLoadTableGraph(context, graph_name, binding)) {
 		throw InvalidInputException("CSR algorithms require a table-backed graph; "
@@ -341,7 +348,7 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 		}
 	}
 
-	auto label_projection = binding.edge.label_column.empty()
+	auto label_projection = !build_edge_labels || binding.edge.label_column.empty()
 	                            ? "CAST(NULL AS VARCHAR)"
 	                            : "CAST(" + GqlQuoteIdentifier(binding.edge.label_column) + " AS VARCHAR)";
 	auto edge_count = GqlQuery(connection, "SELECT count(*)::UBIGINT FROM " + QualifiedTable(binding.edge));
@@ -351,9 +358,12 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 	auto edge_source = "CAST(" + GqlQuoteIdentifier(binding.edge_source_column) + " AS UBIGINT)";
 	auto edge_target = "CAST(" + GqlQuoteIdentifier(binding.edge_target_column) + " AS UBIGINT)";
 	auto edge_table = QualifiedTable(binding.edge);
-	auto endpoint_projection =
-	    "SELECT " + edge_key + ", " + edge_source + ", " + edge_target + ", CAST(rowid AS UBIGINT) FROM " + edge_table;
-	auto edge_projection = "SELECT " + edge_key + ", " + edge_source + ", " + edge_target + ", " + label_projection +
+	auto projected_edge_key = build_edge_ids ? edge_key : "CAST(0 AS UBIGINT)";
+	auto projected_row_id = build_edge_ids ? "CAST(rowid AS UBIGINT)" : "CAST(0 AS UBIGINT)";
+	auto endpoint_projection = "SELECT " + projected_edge_key + ", " + edge_source + ", " + edge_target + ", " +
+	                           projected_row_id + " FROM " + edge_table;
+	auto edge_projection = "SELECT " + projected_edge_key + ", " + edge_source + ", " + edge_target + ", " +
+	                       label_projection +
 	                       " FROM " + edge_table;
 	// COPY GRAPH owns these tables and generates monotonically unique IDs. Keep
 	// duplicate validation for any future non-managed/table-attachment path,
@@ -369,6 +379,10 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 	}
 	if (build_incoming) {
 		snapshot->incoming_offsets.assign(snapshot->vertex_ids.size() + 1, 0);
+	}
+	if (build_out_degrees) {
+		snapshot->outgoing_degrees.Resize(snapshot->vertex_ids.size(),
+		                                  expected_edges <= std::numeric_limits<uint32_t>::max());
 	}
 	auto degree_rows = connection.SendQuery(endpoint_projection);
 	GqlThrowOnError(*degree_rows);
@@ -392,12 +406,13 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 			auto source_index = source_data.sel->get_index(row);
 			auto target_index = target_data.sel->get_index(row);
 			auto row_id_index = row_id_data.sel->get_index(row);
-			if (!edge_id_data.validity.RowIsValid(edge_index) || !source_data.validity.RowIsValid(source_index) ||
-			    !target_data.validity.RowIsValid(target_index) || !row_id_data.validity.RowIsValid(row_id_index)) {
+			if ((build_edge_ids && (!edge_id_data.validity.RowIsValid(edge_index) ||
+			                       !row_id_data.validity.RowIsValid(row_id_index))) ||
+			    !source_data.validity.RowIsValid(source_index) || !target_data.validity.RowIsValid(target_index)) {
 				throw InvalidInputException("Table-backed CSR edge keys and endpoints "
 				                            "must not contain NULL values");
 			}
-			auto edge_id = edge_id_values[edge_index];
+			auto edge_id = build_edge_ids ? edge_id_values[edge_index] : NumericCast<uint64_t>(counted_edges + 1);
 			if (build_edge_ids) {
 				snapshot->edge_ids_match_rowids =
 				    snapshot->edge_ids_match_rowids && edge_id > 0 && row_id_values[row_id_index] == edge_id - 1;
@@ -414,6 +429,9 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 			}
 			if (build_incoming) {
 				snapshot->incoming_offsets[target + 1]++;
+			}
+			if (build_out_degrees) {
+				snapshot->outgoing_degrees.Set(source, snapshot->outgoing_degrees[source] + 1);
 			}
 			counted_edges++;
 		}
@@ -576,7 +594,8 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 	}
 	snapshot->topology_bytes =
 	    snapshot->outgoing_offsets.capacity() * sizeof(uint64_t) + snapshot->outgoing_neighbors.AllocatedBytes() +
-	    snapshot->incoming_offsets.capacity() * sizeof(uint64_t) + snapshot->incoming_neighbors.AllocatedBytes();
+	    snapshot->incoming_offsets.capacity() * sizeof(uint64_t) + snapshot->incoming_neighbors.AllocatedBytes() +
+	    snapshot->outgoing_degrees.AllocatedBytes();
 	snapshot->identity_bytes = snapshot->vertex_ids.AllocatedBytes() +
 	                           snapshot->outgoing_edge_ids.capacity() * sizeof(uint64_t) +
 	                           snapshot->incoming_edge_ids.capacity() * sizeof(uint64_t);
@@ -649,11 +668,14 @@ shared_ptr<const GqlCsrSnapshot> GqlGetCsrSnapshot(ClientContext &context, const
 }
 
 shared_ptr<const GqlCsrSnapshot> GqlGetOrBuildCsrSnapshot(ClientContext &context, const string &graph_name,
-                                                          GqlCsrCapabilities capabilities) {
+                                                          GqlCsrCapabilities capabilities, bool *built) {
 	if (!context.transaction.IsAutoCommit()) {
 		throw NotImplementedException("CSR algorithms are not eligible inside an explicit transaction");
 	}
 	capabilities = NormalizeCsrCapabilities(capabilities);
+	if (built) {
+		*built = false;
+	}
 	auto cache = context.registered_state->GetOrCreate<GqlCsrCacheState>(GQL_CSR_STATE_KEY);
 	try {
 		return GetPreparedTableSnapshot(context, graph_name, *cache, capabilities);
@@ -662,6 +684,9 @@ shared_ptr<const GqlCsrSnapshot> GqlGetOrBuildCsrSnapshot(ClientContext &context
 		// missing or stale algorithm projection is rebuilt transparently.
 	}
 	auto snapshot = BuildTableSnapshot(context, graph_name, capabilities);
+	if (built) {
+		*built = true;
+	}
 	auto &snapshots = cache->snapshots[snapshot->graph_id];
 	snapshots.erase(std::remove_if(snapshots.begin(), snapshots.end(),
 	                               [&](const shared_ptr<GqlCsrSnapshot> &entry) {
@@ -1230,13 +1255,14 @@ static unique_ptr<FunctionData> CsrStatsBind(ClientContext &, TableFunctionBindI
 	         "has_edge_labels",
 	         "has_vertex_labels",
 	         "has_vertex_label_postings",
-	         "has_edge_stats"};
+	         "has_edge_stats",
+	         "has_out_degrees"};
 	return_types = {LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::BOOLEAN, LogicalType::UBIGINT,
 	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::UBIGINT, LogicalType::UBIGINT,
 	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN};
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN};
 	return std::move(result);
 }
 
@@ -1321,6 +1347,8 @@ static void CsrStatsFunction(ClientContext &context, TableFunctionInput &input, 
 	output.SetValue(20, 0, Value::BOOLEAN(snapshot->capabilities & GQL_CSR_VERTEX_LABELS));
 	output.SetValue(21, 0, Value::BOOLEAN(snapshot->capabilities & GQL_CSR_VERTEX_LABEL_POSTINGS));
 	output.SetValue(22, 0, Value::BOOLEAN(snapshot->capabilities & GQL_CSR_EDGE_STATS));
+	output.SetValue(23, 0, Value::BOOLEAN((snapshot->capabilities & GQL_CSR_OUT_DEGREES) ||
+	                                      (snapshot->capabilities & GQL_CSR_OUTGOING)));
 	state.done = true;
 }
 

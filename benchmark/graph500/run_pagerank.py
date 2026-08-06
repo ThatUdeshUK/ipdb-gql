@@ -22,8 +22,9 @@ from typing import Any
 
 GRAPH500_URL = "https://github.com/graph500/graph500.git"
 EDGE_FACTOR = 16
-PAGERANK_BYTES_PER_VERTEX = 24
+PAGERANK_BYTES_PER_VERTEX = 16
 CSR_OFFSET_BYTES = 8
+CSR_DEGREE_BYTES = 4
 COMPACT_NEIGHBOR_BYTES = 4
 WIDE_NEIGHBOR_BYTES = 8
 
@@ -175,10 +176,10 @@ def estimate_native_bytes(scale: int) -> int:
     vertices = 1 << scale
     edges = EDGE_FACTOR * vertices
     neighbor_bytes = COMPACT_NEIGHBOR_BYTES if vertices - 1 <= (1 << 32) - 1 else WIDE_NEIGHBOR_BYTES
-    # Unfiltered PageRank requests outgoing topology only. Dense generated IDs
-    # are implicit, and edge identities, labels, incoming topology, and label
-    # postings are not materialized.
-    csr_bytes = CSR_OFFSET_BYTES * (vertices + 1) + neighbor_bytes * edges
+    # Unfiltered PageRank requests incoming topology plus compact outgoing
+    # degrees. Dense generated IDs are implicit, and edge identities, labels,
+    # outgoing neighbors, and label postings are not materialized.
+    csr_bytes = CSR_OFFSET_BYTES * (vertices + 1) + neighbor_bytes * edges + CSR_DEGREE_BYTES * vertices
     return csr_bytes + PAGERANK_BYTES_PER_VERTEX * vertices
 
 
@@ -299,7 +300,7 @@ def parse_pagerank_result(output: str) -> dict[str, Any]:
     rank_match = re.search(r"(?m)^(\d+),(true|false),([0-9.eE+-]+)$", output)
     if not csr_match or not rank_match:
         raise RuntimeError("could not parse CSR or PageRank result; inspect pagerank.log")
-    return {
+    result = {
         "vertices": int(csr_match.group(1)),
         "edges": int(csr_match.group(2)),
         "csr_bytes": int(csr_match.group(3)),
@@ -307,6 +308,29 @@ def parse_pagerank_result(output: str) -> dict[str, Any]:
         "converged": rank_match.group(2) == "true",
         "rank_sum": float(rank_match.group(3)),
     }
+    for phase in ("cold", "warm"):
+        metrics_match = re.search(
+            rf"(?m)^algorithm_metrics_{phase},(true|false),"
+            r"([0-9.eE+-]+),([0-9.eE+-]+),([0-9.eE+-]+),([0-9.eE+-]+),([0-9.eE+-]+),"
+            r"(\d+),(\d+),(\d+),(\d+),(true|false)$",
+            output,
+        )
+        if not metrics_match:
+            raise RuntimeError(f"could not parse {phase} algorithm metrics; inspect pagerank.log")
+        result[f"{phase}_metrics"] = {
+            "csr_built": metrics_match.group(1) == "true",
+            "csr_seconds": float(metrics_match.group(2)),
+            "initialization_seconds": float(metrics_match.group(3)),
+            "iteration_seconds": float(metrics_match.group(4)),
+            "output_seconds": float(metrics_match.group(5)),
+            "total_seconds": float(metrics_match.group(6)),
+            "worker_count": int(metrics_match.group(7)),
+            "vertices": int(metrics_match.group(8)),
+            "edges": int(metrics_match.group(9)),
+            "iterations": int(metrics_match.group(10)),
+            "converged": metrics_match.group(11) == "true",
+        }
+    return result
 
 
 def run_pagerank(
@@ -355,8 +379,13 @@ def main() -> int:
     reference = (args.graph500_dir or work_dir / "graph500-reference").resolve()
     generator = work_dir / "bin/generate_graph500_csv"
     work_dir.mkdir(parents=True, exist_ok=True)
-    ensure_reference_checkout(reference)
-    compile_generator(reference, generator)
+    if (reference / "generator/graph_generator.c").is_file():
+        compile_generator(reference, generator)
+    elif generator.is_file():
+        print(f"Reusing existing compiled Graph500 generator at {generator}")
+    else:
+        ensure_reference_checkout(reference)
+        compile_generator(reference, generator)
 
     physical = physical_memory_bytes()
     if physical:
@@ -443,6 +472,7 @@ def main() -> int:
             f"Scale {scale} complete: CSR {human_bytes(result['csr_bytes'])}, "
             f"cold CSR+PageRank {result['cold_pagerank_and_csr_seconds']:.3f}s, "
             f"warm PageRank {result['pagerank_seconds']:.3f}s, "
+            f"{result['warm_metrics']['worker_count']} workers, "
             f"{result['iterations']} iterations, converged={result['converged']}"
         )
 
