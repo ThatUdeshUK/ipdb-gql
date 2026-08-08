@@ -225,12 +225,12 @@ bool GqlTryGetCsrOrdinal(const GqlCsrSnapshot &snapshot, uint64_t vertex_id, idx
 shared_ptr<const GqlCsrSnapshot> GqlGetCsrSnapshot(ClientContext &context, const string &graph_name);
 
 //! Return a current capability-compatible snapshot, building it automatically
-//! when the calling algorithm has not prepared one on this connection yet.
+//! when the database instance has not prepared one yet.
 shared_ptr<const GqlCsrSnapshot> GqlGetOrBuildCsrSnapshot(ClientContext &context, const string &graph_name,
                                                           GqlCsrCapabilities capabilities, bool *built = nullptr);
 
-//! Returns a current connection-local snapshot when one is available and
-//! valid. Unlike GqlGetCsrSnapshot, this is a non-throwing optimizer probe.
+//! Returns a current database-scoped snapshot when one is available and valid.
+//! Unlike GqlGetCsrSnapshot, this is a non-throwing optimizer probe.
 shared_ptr<const GqlCsrSnapshot> GqlTryGetCsrSnapshot(ClientContext &context, const string &graph_name);
 
 //! Register a lightweight observer that invalidates snapshots when a prepared

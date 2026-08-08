@@ -261,12 +261,15 @@ ORDER BY community_size DESC, vertex_id;
 Louvain currently uses an unweighted simple-undirected projection: reciprocal
 and parallel edges are coalesced, and self-loops are ignored.
 
-CSR snapshots are connection-local and version checked. Graph mutations and
-direct SQL writes to a graph's vertex or edge tables invalidate the affected
-snapshot instead of allowing an algorithm to use stale data. The next algorithm
-call rebuilds its required projection automatically. Run `gql_build_csr`
-explicitly only to prepare the full optimizer/neighbor/inspection snapshot.
-CSR construction and CSR algorithms must run in autocommit mode.
+CSR snapshots are immutable, database-instance scoped, and version checked.
+Connections sharing one DuckDB database instance reuse the same derived graph
+projection. Graph mutations and direct SQL writes to a graph's vertex or edge
+tables invalidate the affected snapshot instead of allowing an algorithm to use
+stale data. The next algorithm call rebuilds its required projection
+automatically, with concurrent automatic builders coalesced per graph. Run
+`gql_build_csr` explicitly only to prepare the full
+optimizer/neighbor/inspection snapshot. CSR construction and CSR algorithms
+must run in autocommit mode.
 
 Weighted SSSP is not implemented.
 
@@ -281,11 +284,14 @@ SELECT * FROM gql_csr_edge_stats('social');
 
 `gql_csr_stats` reports the smallest current projection and exposes capability
 columns such as `has_outgoing`, `has_incoming`, `has_edge_ids`, and
-`has_edge_labels`. `gql_csr_edge_stats` reports per-type edge counts, active
-source/target counts, average directional degree, and maximum directional
-degree. The graph optimizer uses these connection-local statistics to compare
-a correlated CSR frontier with a bulk edge-table scan and to avoid treating a
-highly skewed one-row endpoint as uniformly selective.
+`has_edge_labels`. Its `snapshot_acquisition_count` distinguishes consumer
+acquisition from CSR construction; fixed-hop and path expansion operators pin
+one immutable snapshot instead of reacquiring it for every lateral seed.
+`gql_csr_edge_stats` reports per-type edge counts, active source/target counts,
+average directional degree, and maximum directional degree. The graph optimizer
+uses these database-scoped statistics to compare a correlated CSR frontier
+with a bulk edge-table scan and to avoid treating a highly skewed one-row
+endpoint as uniformly selective.
 
 ## Storage model
 
@@ -301,7 +307,7 @@ The private catalog contains metadata only; vertices, edges, labels, and
 properties are not stored as entity-attribute-value rows. The managed tables
 remain ordinary DuckDB relations and are authoritative for querying and
 mutation. Nodes retain their complete native `VARCHAR[]` label set. Each edge
-has exactly one scalar, immutable type. A CSR build derives connection-local
+has exactly one scalar, immutable type. A CSR build derives database-scoped
 topology and node-label posting lists from those tables; it does not create a
 second authoritative store.
 
@@ -370,8 +376,9 @@ read-only referenced-table mode is planned.
   not imply semantic or transactional conformance.
 - `CREATE GRAPH`, `DROP GRAPH`, and the full-load `COPY GRAPH` operation are
   autocommit-only. `COPY GRAPH` requires an empty graph.
-- CSR construction and CSR algorithms are autocommit-only and snapshots are
-  local to the connection that built them.
+- CSR construction and CSR algorithms are autocommit-only. Snapshots are shared
+  by connections in one database instance, but are not persisted across process
+  or database-instance restarts.
 - Bulk import currently accepts one vertex file, one edge file, at most one
   scalar vertex label column, and one edge type column. Every relationship row
   must contain exactly one non-empty type.

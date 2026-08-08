@@ -21,15 +21,17 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace duckdb {
 
-static constexpr const char *GQL_CSR_STATE_KEY = "gql_csr_state";
 static constexpr const char *GQL_CSR_WRITE_OBSERVER_STATE_KEY = "gql_csr_write_observer_state";
 static constexpr const char *GQL_CSR_GENERATION_CACHE_KEY = "gql_csr_generation_state";
+static constexpr const char *GQL_DERIVED_GRAPH_STORAGE_CACHE_KEY = "gql_derived_graph_storage_state";
 
 struct GqlCsrGenerationState : ObjectCacheEntry {
 	static string ObjectType() {
@@ -111,11 +113,37 @@ static string QualifiedTable(const GqlElementTableBinding &table) {
 	       GqlQuoteIdentifier(table.table_name);
 }
 
-struct GqlCsrCacheState : ClientContextState {
+// Database-instance owner for immutable graph projections. The canonical graph
+// remains in DuckDB tables; this manager publishes versioned derived layouts
+// that every connection in the same DatabaseInstance can lease and reuse.
+struct GqlDerivedGraphStorageState : ObjectCacheEntry {
+	static string ObjectType() {
+		return "gql_derived_graph_storage_state";
+	}
+
+	string GetObjectType() override {
+		return ObjectType();
+	}
+
+	optional_idx GetEstimatedCacheMemory() const override {
+		// The manager is intentionally non-evictable in this first slice. It
+		// eagerly removes stale and dominated projections below; bounded,
+		// reservation-backed LRU eviction is the next storage slice.
+		return optional_idx {};
+	}
+
+	mutex lock;
+	std::condition_variable build_finished;
 	unordered_map<uint64_t, vector<shared_ptr<GqlCsrSnapshot>>> snapshots;
-	unordered_map<string, uint64_t> graph_ids_by_name;
+	unordered_set<uint64_t> builds_in_progress;
 	uint64_t build_count = 0;
+	atomic<uint64_t> acquisition_count {0};
 };
+
+static shared_ptr<GqlDerivedGraphStorageState> GetDerivedGraphStorageState(ClientContext &context) {
+	return ObjectCache::GetObjectCache(context).GetOrCreate<GqlDerivedGraphStorageState>(
+	    GQL_DERIVED_GRAPH_STORAGE_CACHE_KEY);
+}
 
 struct GraphVersion {
 	uint64_t graph_id;
@@ -625,46 +653,91 @@ static bool CsrSnapshotIsCurrent(ClientContext &context, const GqlCsrSnapshot &s
 	       snapshot.edge_write_generation == ReadCsrTableWriteGeneration(context, snapshot.edge_table_key);
 }
 
-static shared_ptr<GqlCsrSnapshot> GetPreparedTableSnapshot(ClientContext &context, const string &graph_name,
-                                                           GqlCsrCacheState &cache,
-                                                           GqlCsrCapabilities required_capabilities) {
-	auto graph_id = cache.graph_ids_by_name.find(graph_name);
-	if (graph_id == cache.graph_ids_by_name.end()) {
-		throw InvalidInputException("CSR for table-backed graph '%s' has not been built on this "
-		                            "connection; run CALL gql_build_csr('%s') first",
-		                            graph_name, graph_name);
+static shared_ptr<GqlCsrSnapshot> FindPreparedTableSnapshotLocked(ClientContext &context,
+                                                                  GqlDerivedGraphStorageState &storage,
+                                                                  const GraphVersion &graph,
+                                                                  GqlCsrCapabilities required_capabilities) {
+	auto entry = storage.snapshots.find(graph.graph_id);
+	if (entry == storage.snapshots.end()) {
+		return nullptr;
 	}
+	auto &snapshots = entry->second;
+	snapshots.erase(std::remove_if(snapshots.begin(), snapshots.end(),
+	                               [&](const shared_ptr<GqlCsrSnapshot> &snapshot) {
+		                               return !CsrSnapshotIsCurrent(context, *snapshot, graph);
+	                               }),
+	                snapshots.end());
+	shared_ptr<GqlCsrSnapshot> best;
+	for (const auto &snapshot : snapshots) {
+		if (!CsrHasCapabilities(snapshot->capabilities, required_capabilities)) {
+			continue;
+		}
+		if (!best || snapshot->memory_bytes < best->memory_bytes) {
+			best = snapshot;
+		}
+	}
+	if (snapshots.empty()) {
+		storage.snapshots.erase(entry);
+	}
+	return best;
+}
+
+static shared_ptr<GqlCsrSnapshot> GetPreparedTableSnapshot(ClientContext &context, const string &graph_name,
+                                                           GqlDerivedGraphStorageState &storage,
+                                                           GqlCsrCapabilities required_capabilities) {
 	Connection connection(*context.db);
 	auto graph = ReadGraphVersion(connection, graph_name);
-	auto entry = cache.snapshots.find(graph_id->second);
-	if (graph.graph_id == graph_id->second && entry != cache.snapshots.end()) {
-		shared_ptr<GqlCsrSnapshot> best;
-		for (const auto &snapshot : entry->second) {
-			if (!CsrHasCapabilities(snapshot->capabilities, required_capabilities) ||
-			    !CsrSnapshotIsCurrent(context, *snapshot, graph)) {
-				continue;
-			}
-			if (!best || snapshot->memory_bytes < best->memory_bytes) {
-				best = snapshot;
-			}
-		}
-		if (best) {
-			return best;
+	lock_guard<mutex> guard(storage.lock);
+	auto snapshot = FindPreparedTableSnapshotLocked(context, storage, graph, required_capabilities);
+	if (snapshot) {
+		return snapshot;
+	}
+	throw InvalidInputException("CSR for table-backed graph '%s' has not been built in this database instance; "
+	                            "run CALL gql_build_csr('%s') first",
+	                            graph_name, graph_name);
+}
+
+static shared_ptr<GqlCsrSnapshot> PublishTableSnapshot(GqlDerivedGraphStorageState &storage,
+                                                       shared_ptr<GqlCsrSnapshot> snapshot) {
+	lock_guard<mutex> guard(storage.lock);
+	auto &snapshots = storage.snapshots[snapshot->graph_id];
+	snapshots.erase(std::remove_if(snapshots.begin(), snapshots.end(),
+	                               [&](const shared_ptr<GqlCsrSnapshot> &entry) {
+		                               const bool stale =
+		                                   entry->graph_version != snapshot->graph_version ||
+		                                   entry->write_generation != snapshot->write_generation ||
+		                                   entry->vertex_write_generation != snapshot->vertex_write_generation ||
+		                                   entry->edge_write_generation != snapshot->edge_write_generation;
+		                               return stale || CsrHasCapabilities(snapshot->capabilities, entry->capabilities);
+	                               }),
+	                snapshots.end());
+	storage.build_count++;
+	shared_ptr<GqlCsrSnapshot> best;
+	for (const auto &entry : snapshots) {
+		if (CsrHasCapabilities(entry->capabilities, snapshot->capabilities) &&
+		    (!best || entry->memory_bytes < best->memory_bytes)) {
+			best = entry;
 		}
 	}
-	{
-		throw InvalidInputException("CSR for table-backed graph '%s' has not been built on this "
-		                            "connection; run CALL gql_build_csr('%s') first",
-		                            graph_name, graph_name);
+	if (best) {
+		return best;
 	}
+	snapshots.push_back(snapshot);
+	return snapshot;
+}
+
+static uint64_t ReadCsrBuildCount(GqlDerivedGraphStorageState &storage) {
+	lock_guard<mutex> guard(storage.lock);
+	return storage.build_count;
 }
 
 shared_ptr<const GqlCsrSnapshot> GqlGetCsrSnapshot(ClientContext &context, const string &graph_name) {
 	if (!context.transaction.IsAutoCommit()) {
 		throw NotImplementedException("CSR algorithms are not eligible inside an explicit transaction");
 	}
-	auto cache = context.registered_state->GetOrCreate<GqlCsrCacheState>(GQL_CSR_STATE_KEY);
-	return GetPreparedTableSnapshot(context, graph_name, *cache, GQL_CSR_FULL);
+	auto storage = GetDerivedGraphStorageState(context);
+	storage->acquisition_count++;
+	return GetPreparedTableSnapshot(context, graph_name, *storage, GQL_CSR_FULL);
 }
 
 shared_ptr<const GqlCsrSnapshot> GqlGetOrBuildCsrSnapshot(ClientContext &context, const string &graph_name,
@@ -676,41 +749,57 @@ shared_ptr<const GqlCsrSnapshot> GqlGetOrBuildCsrSnapshot(ClientContext &context
 	if (built) {
 		*built = false;
 	}
-	auto cache = context.registered_state->GetOrCreate<GqlCsrCacheState>(GQL_CSR_STATE_KEY);
-	try {
-		return GetPreparedTableSnapshot(context, graph_name, *cache, capabilities);
-	} catch (const InvalidInputException &) {
-		// The graph and its table binding are validated by the builder below. A
-		// missing or stale algorithm projection is rebuilt transparently.
+	auto storage = GetDerivedGraphStorageState(context);
+	storage->acquisition_count++;
+	bool performed_build = false;
+	while (true) {
+		Connection connection(*context.db);
+		auto graph = ReadGraphVersion(connection, graph_name);
+		{
+			unique_lock<mutex> guard(storage->lock);
+			auto snapshot = FindPreparedTableSnapshotLocked(context, *storage, graph, capabilities);
+			if (snapshot) {
+				if (built) {
+					*built = performed_build;
+				}
+				return snapshot;
+			}
+			if (storage->builds_in_progress.find(graph.graph_id) != storage->builds_in_progress.end()) {
+				storage->build_finished.wait(guard, [&] {
+					return storage->builds_in_progress.find(graph.graph_id) == storage->builds_in_progress.end();
+				});
+				continue;
+			}
+			storage->builds_in_progress.insert(graph.graph_id);
+		}
+		try {
+			PublishTableSnapshot(*storage, BuildTableSnapshot(context, graph_name, capabilities));
+			performed_build = true;
+		} catch (...) {
+			{
+				lock_guard<mutex> guard(storage->lock);
+				storage->builds_in_progress.erase(graph.graph_id);
+			}
+			storage->build_finished.notify_all();
+			throw;
+		}
+		{
+			lock_guard<mutex> guard(storage->lock);
+			storage->builds_in_progress.erase(graph.graph_id);
+		}
+		storage->build_finished.notify_all();
+		// Re-enter lookup so a write that raced construction invalidates the new
+		// projection before any consumer can lease it.
 	}
-	auto snapshot = BuildTableSnapshot(context, graph_name, capabilities);
-	if (built) {
-		*built = true;
-	}
-	auto &snapshots = cache->snapshots[snapshot->graph_id];
-	snapshots.erase(std::remove_if(snapshots.begin(), snapshots.end(),
-	                               [&](const shared_ptr<GqlCsrSnapshot> &entry) {
-		                               const bool stale =
-		                                   entry->graph_version != snapshot->graph_version ||
-		                                   entry->write_generation != snapshot->write_generation ||
-		                                   entry->vertex_write_generation != snapshot->vertex_write_generation ||
-		                                   entry->edge_write_generation != snapshot->edge_write_generation;
-		                               return stale || CsrHasCapabilities(snapshot->capabilities, entry->capabilities);
-	                               }),
-	                snapshots.end());
-	snapshots.push_back(snapshot);
-	cache->graph_ids_by_name[graph_name] = snapshot->graph_id;
-	cache->build_count++;
-	return snapshot;
 }
 
 shared_ptr<const GqlCsrSnapshot> GqlTryGetCsrSnapshot(ClientContext &context, const string &graph_name) {
 	if (!context.transaction.IsAutoCommit()) {
 		return nullptr;
 	}
-	auto cache = context.registered_state->GetOrCreate<GqlCsrCacheState>(GQL_CSR_STATE_KEY);
+	auto storage = GetDerivedGraphStorageState(context);
 	try {
-		return GetPreparedTableSnapshot(context, graph_name, *cache, GQL_CSR_FULL);
+		return GetPreparedTableSnapshot(context, graph_name, *storage, GQL_CSR_FULL);
 	} catch (const InvalidInputException &) {
 		return nullptr;
 	}
@@ -844,15 +933,16 @@ static void NeighborsFunction(ClientContext &context, TableFunctionInput &input,
 
 struct CsrExpandLocalState : LocalTableFunctionState {
 	shared_ptr<const GqlCsrSnapshot> snapshot;
+	string graph_name;
+	string edge_label;
 	idx_t cursor = 0;
 	idx_t end = 0;
 	bool initialized = false;
+	bool active = false;
 	bool outgoing = true;
-	bool filter_label = false;
 	bool label_exists = true;
 	uint32_t label_id = 0;
 	uint64_t vertex_id = 0;
-	string edge_label;
 };
 
 static unique_ptr<FunctionData> CsrExpandBind(ClientContext &, TableFunctionBindInput &,
@@ -862,8 +952,17 @@ static unique_ptr<FunctionData> CsrExpandBind(ClientContext &, TableFunctionBind
 	return make_uniq<TableFunctionData>();
 }
 
+struct CsrExpandGlobalState : GlobalTableFunctionState {
+	// A physical expansion operator may receive many one-row lateral inputs and
+	// may create several local states. Pin one immutable snapshot per graph for
+	// the operator lifetime so seed processing never repeats catalog/version
+	// validation.
+	mutex lock;
+	unordered_map<string, shared_ptr<const GqlCsrSnapshot>> snapshots;
+};
+
 static unique_ptr<GlobalTableFunctionState> CsrExpandGlobalInit(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<GlobalTableFunctionState>();
+	return make_uniq<CsrExpandGlobalState>();
 }
 
 static unique_ptr<LocalTableFunctionState> CsrExpandLocalInit(ExecutionContext &, TableFunctionInitInput &,
@@ -871,7 +970,29 @@ static unique_ptr<LocalTableFunctionState> CsrExpandLocalInit(ExecutionContext &
 	return make_uniq<CsrExpandLocalState>();
 }
 
-static void InitializeCsrExpansion(ExecutionContext &context, DataChunk &input, CsrExpandLocalState &state) {
+static shared_ptr<const GqlCsrSnapshot>
+AcquireCsrOperatorSnapshot(ExecutionContext &context, CsrExpandGlobalState &global, const string &graph_name) {
+	lock_guard<mutex> guard(global.lock);
+	auto entry = global.snapshots.find(graph_name);
+	if (entry != global.snapshots.end()) {
+		return entry->second;
+	}
+	auto snapshot = GqlGetCsrSnapshot(context.client, graph_name);
+	global.snapshots.emplace(graph_name, snapshot);
+	return snapshot;
+}
+
+static void ResetCsrExpansionInput(CsrExpandLocalState &state) {
+	state.cursor = 0;
+	state.end = 0;
+	state.initialized = false;
+	state.active = false;
+	state.outgoing = true;
+	state.vertex_id = 0;
+}
+
+static void InitializeCsrExpansion(ExecutionContext &context, DataChunk &input, CsrExpandGlobalState &global,
+                                   CsrExpandLocalState &state) {
 	if (input.size() != 1 || input.ColumnCount() != 1) {
 		throw InternalException("GQL CSR expansion requires one lateral input row");
 	}
@@ -886,23 +1007,25 @@ static void InitializeCsrExpansion(ExecutionContext &context, DataChunk &input, 
 	}
 	auto graph_name = fields[0].GetValue<string>();
 	auto direction = StringUtil::Lower(fields[2].GetValue<string>());
-	state.edge_label = StringUtil::Lower(fields[3].GetValue<string>());
+	auto edge_label = StringUtil::Lower(fields[3].GetValue<string>());
 	if (direction != "out" && direction != "in") {
 		throw InvalidInputException("GQL CSR expansion direction must be 'out' or 'in'");
 	}
-	if (state.edge_label.empty()) {
+	if (edge_label.empty()) {
 		throw InvalidInputException("GQL CSR expansion requires one edge label");
 	}
 	state.outgoing = direction == "out";
-	state.filter_label = true;
-	state.snapshot = GqlGetCsrSnapshot(context.client, graph_name);
-	auto label = state.snapshot->label_ids.find(state.edge_label);
-	if (label == state.snapshot->label_ids.end()) {
-		state.label_exists = false;
-		state.initialized = true;
-		return;
+	if (!state.snapshot || state.graph_name != graph_name) {
+		state.snapshot = AcquireCsrOperatorSnapshot(context, global, graph_name);
+		state.graph_name = std::move(graph_name);
+		state.edge_label.clear();
 	}
-	state.label_id = label->second;
+	if (state.edge_label != edge_label) {
+		state.edge_label = std::move(edge_label);
+		auto label = state.snapshot->label_ids.find(state.edge_label);
+		state.label_exists = label != state.snapshot->label_ids.end();
+		state.label_id = state.label_exists ? label->second : 0;
+	}
 	if (fields[1].IsNull()) {
 		state.initialized = true;
 		return;
@@ -916,6 +1039,7 @@ static void InitializeCsrExpansion(ExecutionContext &context, DataChunk &input, 
 	const auto &offsets = state.outgoing ? state.snapshot->outgoing_offsets : state.snapshot->incoming_offsets;
 	state.cursor = offsets[vertex];
 	state.end = offsets[vertex + 1];
+	state.active = state.label_exists;
 	state.initialized = true;
 }
 
@@ -923,10 +1047,11 @@ static OperatorResultType CsrExpandFunction(ExecutionContext &context, TableFunc
                                             DataChunk &output) {
 	auto &state = data_p.local_state->Cast<CsrExpandLocalState>();
 	if (!state.initialized) {
-		InitializeCsrExpansion(context, input, state);
+		auto &global = data_p.global_state->Cast<CsrExpandGlobalState>();
+		InitializeCsrExpansion(context, input, global, state);
 	}
-	if (!state.snapshot || !state.label_exists) {
-		state = CsrExpandLocalState();
+	if (!state.active) {
+		ResetCsrExpansionInput(state);
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
@@ -936,7 +1061,7 @@ static OperatorResultType CsrExpandFunction(ExecutionContext &context, TableFunc
 	idx_t count = 0;
 	while (state.cursor < state.end && count < STANDARD_VECTOR_SIZE) {
 		auto index = state.cursor++;
-		if (state.filter_label && label_ids[index] != state.label_id) {
+		if (label_ids[index] != state.label_id) {
 			continue;
 		}
 		auto neighbor_id = state.snapshot->vertex_ids[neighbors[index]];
@@ -950,7 +1075,7 @@ static OperatorResultType CsrExpandFunction(ExecutionContext &context, TableFunc
 	if (state.cursor < state.end) {
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
-	state = CsrExpandLocalState();
+	ResetCsrExpansionInput(state);
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
@@ -1081,9 +1206,12 @@ struct CsrPathFrame {
 
 struct CsrPathExpandLocalState : LocalTableFunctionState {
 	shared_ptr<const GqlCsrSnapshot> snapshot;
+	string graph_name;
+	string edge_label;
 	vector<CsrPathFrame> frames;
 	vector<uint64_t> edge_ids;
 	bool initialized = false;
+	bool active = false;
 	bool outgoing = true;
 	bool label_exists = true;
 	bool unbounded = false;
@@ -1093,7 +1221,6 @@ struct CsrPathExpandLocalState : LocalTableFunctionState {
 	idx_t maximum_repetitions = 1;
 	uint64_t start_id = 0;
 	uint64_t current_end_id = 0;
-	string edge_label;
 };
 
 static unique_ptr<FunctionData> CsrPathExpandBind(ClientContext &, TableFunctionBindInput &,
@@ -1108,7 +1235,22 @@ static unique_ptr<LocalTableFunctionState> CsrPathExpandLocalInit(ExecutionConte
 	return make_uniq<CsrPathExpandLocalState>();
 }
 
-static void InitializeCsrPathExpansion(ExecutionContext &context, DataChunk &input, CsrPathExpandLocalState &state) {
+static void ResetCsrPathExpansionInput(CsrPathExpandLocalState &state) {
+	state.frames.clear();
+	state.edge_ids.clear();
+	state.initialized = false;
+	state.active = false;
+	state.outgoing = true;
+	state.unbounded = false;
+	state.zero_pending = false;
+	state.minimum_repetitions = 1;
+	state.maximum_repetitions = 1;
+	state.start_id = 0;
+	state.current_end_id = 0;
+}
+
+static void InitializeCsrPathExpansion(ExecutionContext &context, DataChunk &input, CsrExpandGlobalState &global,
+                                       CsrPathExpandLocalState &state) {
 	if (input.size() != 1 || input.ColumnCount() != 1) {
 		throw InternalException("GQL CSR path expansion requires one lateral input row");
 	}
@@ -1124,26 +1266,29 @@ static void InitializeCsrPathExpansion(ExecutionContext &context, DataChunk &inp
 	}
 	auto graph_name = fields[0].GetValue<string>();
 	auto direction = StringUtil::Lower(fields[2].GetValue<string>());
-	state.edge_label = StringUtil::Lower(fields[3].GetValue<string>());
+	auto edge_label = StringUtil::Lower(fields[3].GetValue<string>());
 	state.minimum_repetitions = NumericCast<idx_t>(fields[4].GetValue<uint64_t>());
 	state.maximum_repetitions = NumericCast<idx_t>(fields[5].GetValue<uint64_t>());
 	state.unbounded = fields[6].GetValue<bool>();
 	if (direction != "out" && direction != "in") {
 		throw InvalidInputException("GQL CSR path expansion direction must be 'out' or 'in'");
 	}
-	if (state.edge_label.empty() || (!state.unbounded && state.minimum_repetitions == 0) ||
+	if (edge_label.empty() || (!state.unbounded && state.minimum_repetitions == 0) ||
 	    (!state.unbounded && state.minimum_repetitions > state.maximum_repetitions)) {
 		throw InvalidInputException("GQL CSR path expansion has an invalid label or repetition range");
 	}
 	state.outgoing = direction == "out";
-	state.snapshot = GqlGetCsrSnapshot(context.client, graph_name);
-	auto label = state.snapshot->label_ids.find(state.edge_label);
-	if (label == state.snapshot->label_ids.end()) {
-		state.label_exists = false;
-		state.initialized = true;
-		return;
+	if (!state.snapshot || state.graph_name != graph_name) {
+		state.snapshot = AcquireCsrOperatorSnapshot(context, global, graph_name);
+		state.graph_name = std::move(graph_name);
+		state.edge_label.clear();
 	}
-	state.label_id = label->second;
+	if (state.edge_label != edge_label) {
+		state.edge_label = std::move(edge_label);
+		auto label = state.snapshot->label_ids.find(state.edge_label);
+		state.label_exists = label != state.snapshot->label_ids.end();
+		state.label_id = state.label_exists ? label->second : 0;
+	}
 	if (fields[1].IsNull()) {
 		state.initialized = true;
 		return;
@@ -1157,6 +1302,7 @@ static void InitializeCsrPathExpansion(ExecutionContext &context, DataChunk &inp
 	}
 	const auto &offsets = state.outgoing ? state.snapshot->outgoing_offsets : state.snapshot->incoming_offsets;
 	state.frames.push_back({vertex, NumericCast<idx_t>(offsets[vertex]), NumericCast<idx_t>(offsets[vertex + 1])});
+	state.active = state.label_exists;
 	state.initialized = true;
 }
 
@@ -1205,10 +1351,11 @@ static OperatorResultType CsrPathExpandFunction(ExecutionContext &context, Table
                                                 DataChunk &output) {
 	auto &state = data_p.local_state->Cast<CsrPathExpandLocalState>();
 	if (!state.initialized) {
-		InitializeCsrPathExpansion(context, input, state);
+		auto &global = data_p.global_state->Cast<CsrExpandGlobalState>();
+		InitializeCsrPathExpansion(context, input, global, state);
 	}
-	if (!state.snapshot || !state.label_exists) {
-		state = CsrPathExpandLocalState();
+	if (!state.active) {
+		ResetCsrPathExpansionInput(state);
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
@@ -1225,7 +1372,7 @@ static OperatorResultType CsrPathExpandFunction(ExecutionContext &context, Table
 	if (!state.frames.empty()) {
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
-	state = CsrPathExpandLocalState();
+	ResetCsrPathExpansionInput(state);
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 
@@ -1256,13 +1403,14 @@ static unique_ptr<FunctionData> CsrStatsBind(ClientContext &, TableFunctionBindI
 	         "has_vertex_labels",
 	         "has_vertex_label_postings",
 	         "has_edge_stats",
-	         "has_out_degrees"};
-	return_types = {LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
-	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::BOOLEAN, LogicalType::UBIGINT,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::UBIGINT, LogicalType::UBIGINT,
-	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN};
+	         "has_out_degrees",
+	         "snapshot_acquisition_count"};
+	return_types = {
+	    LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	    LogicalType::UBIGINT, LogicalType::BOOLEAN, LogicalType::UBIGINT, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	    LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	    LogicalType::UBIGINT, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	    LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::UBIGINT};
 	return std::move(result);
 }
 
@@ -1290,17 +1438,19 @@ static void BuildCsrFunction(ClientContext &context, TableFunctionInput &input, 
 		Connection storage_connection(*context.db);
 		GqlEnsureStorage(storage_connection);
 	}
-	auto cache = context.registered_state->GetOrCreate<GqlCsrCacheState>(GQL_CSR_STATE_KEY);
+	auto storage = GetDerivedGraphStorageState(context);
 	GqlTableGraphBinding binding;
 	if (!GqlTryLoadTableGraph(context, data.graph_name, binding)) {
 		throw InvalidInputException("Graph '%s' has no native tables; load it with "
 		                            "COPY GRAPH before building CSR",
 		                            data.graph_name);
 	}
-	auto snapshot = BuildTableSnapshot(context, data.graph_name, GQL_CSR_FULL);
-	cache->snapshots[snapshot->graph_id] = {snapshot};
-	cache->graph_ids_by_name[data.graph_name] = snapshot->graph_id;
-	cache->build_count++;
+	PublishTableSnapshot(*storage, BuildTableSnapshot(context, data.graph_name, GQL_CSR_FULL));
+	// Publication is followed by the same generation check used by consumers.
+	// If a write raced construction, CALL must not report a stale projection as
+	// successfully prepared.
+	auto snapshot = GetPreparedTableSnapshot(context, data.graph_name, *storage, GQL_CSR_FULL);
+	auto build_count = ReadCsrBuildCount(*storage);
 
 	output.SetCardinality(1);
 	output.SetValue(0, 0, Value(data.graph_name));
@@ -1308,7 +1458,7 @@ static void BuildCsrFunction(ClientContext &context, TableFunctionInput &input, 
 	output.SetValue(2, 0, Value::UBIGINT(snapshot->vertex_ids.size()));
 	output.SetValue(3, 0, Value::UBIGINT(snapshot->edge_count));
 	output.SetValue(4, 0, Value::UBIGINT(snapshot->memory_bytes));
-	output.SetValue(5, 0, Value::UBIGINT(cache->build_count));
+	output.SetValue(5, 0, Value::UBIGINT(build_count));
 	state.done = true;
 }
 
@@ -1318,15 +1468,16 @@ static void CsrStatsFunction(ClientContext &context, TableFunctionInput &input, 
 		return;
 	}
 	auto &data = input.bind_data->Cast<CsrBindData>();
-	auto cache = context.registered_state->GetOrCreate<GqlCsrCacheState>(GQL_CSR_STATE_KEY);
-	auto snapshot = GetPreparedTableSnapshot(context, data.graph_name, *cache, 0);
+	auto storage = GetDerivedGraphStorageState(context);
+	auto snapshot = GetPreparedTableSnapshot(context, data.graph_name, *storage, 0);
+	auto build_count = ReadCsrBuildCount(*storage);
 	output.SetCardinality(1);
 	output.SetValue(0, 0, Value(data.graph_name));
 	output.SetValue(1, 0, Value::UBIGINT(snapshot->graph_version));
 	output.SetValue(2, 0, Value::UBIGINT(snapshot->vertex_ids.size()));
 	output.SetValue(3, 0, Value::UBIGINT(snapshot->edge_count));
 	output.SetValue(4, 0, Value::UBIGINT(snapshot->memory_bytes));
-	output.SetValue(5, 0, Value::UBIGINT(cache->build_count));
+	output.SetValue(5, 0, Value::UBIGINT(build_count));
 	output.SetValue(6, 0, Value(true));
 	output.SetValue(7, 0,
 	                Value::UBIGINT((snapshot->capabilities & GQL_CSR_OUTGOING)
@@ -1347,8 +1498,10 @@ static void CsrStatsFunction(ClientContext &context, TableFunctionInput &input, 
 	output.SetValue(20, 0, Value::BOOLEAN(snapshot->capabilities & GQL_CSR_VERTEX_LABELS));
 	output.SetValue(21, 0, Value::BOOLEAN(snapshot->capabilities & GQL_CSR_VERTEX_LABEL_POSTINGS));
 	output.SetValue(22, 0, Value::BOOLEAN(snapshot->capabilities & GQL_CSR_EDGE_STATS));
-	output.SetValue(23, 0, Value::BOOLEAN((snapshot->capabilities & GQL_CSR_OUT_DEGREES) ||
-	                                      (snapshot->capabilities & GQL_CSR_OUTGOING)));
+	output.SetValue(
+	    23, 0,
+	    Value::BOOLEAN((snapshot->capabilities & GQL_CSR_OUT_DEGREES) || (snapshot->capabilities & GQL_CSR_OUTGOING)));
+	output.SetValue(24, 0, Value::UBIGINT(storage->acquisition_count.load()));
 	state.done = true;
 }
 

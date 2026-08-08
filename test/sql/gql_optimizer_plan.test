@@ -159,6 +159,74 @@ physical_plan	<REGEX>:.*graph_1_vertices.*
 statement ok
 CALL gql_build_csr('optimizer_plan')
 
+# Fixed and path expansions pin one immutable CSR snapshot in their physical
+# operator state. Multiple lateral seeds must not reacquire and revalidate the
+# same database-scoped snapshot once per seed.
+statement ok
+CREATE TEMP TABLE csr_acquisition_checkpoint AS
+SELECT snapshot_acquisition_count AS value
+FROM gql_csr_stats('optimizer_plan')
+
+query IIIT rowsort
+SELECT expansion.__gql_edge_id,
+       expansion.__gql_source_id,
+       expansion.__gql_target_id,
+       expansion.__gql_type
+FROM (VALUES (1::UBIGINT), (2::UBIGINT)) seed(vertex_id),
+LATERAL gql_csr_expand(struct_pack(
+    graph_name := 'optimizer_plan',
+    vertex_id := seed.vertex_id,
+    direction := 'out',
+    edge_label := 'KNOWS'
+)) expansion
+----
+1	1	2	knows
+2	2	3	knows
+
+query I
+SELECT stats.snapshot_acquisition_count - checkpoint.value
+FROM gql_csr_stats('optimizer_plan') stats, csr_acquisition_checkpoint checkpoint
+----
+1
+
+statement ok
+DELETE FROM csr_acquisition_checkpoint
+
+statement ok
+INSERT INTO csr_acquisition_checkpoint
+SELECT snapshot_acquisition_count
+FROM gql_csr_stats('optimizer_plan')
+
+query IIIT rowsort
+SELECT expansion.__gql_edge_id,
+       expansion.__gql_source_id,
+       expansion.__gql_target_id,
+       expansion.__gql_type
+FROM (VALUES (1::UBIGINT), (2::UBIGINT)) seed(vertex_id),
+LATERAL gql_csr_path_expand(struct_pack(
+    graph_name := 'optimizer_plan',
+    vertex_id := seed.vertex_id,
+    direction := 'out',
+    edge_label := 'KNOWS',
+    minimum_repetitions := 1::UBIGINT,
+    maximum_repetitions := 2::UBIGINT,
+    unbounded := false
+)) expansion
+----
+1	1	2	knows
+2	1	3	knows
+2	2	3	knows
+3	2	4	knows
+
+query I
+SELECT stats.snapshot_acquisition_count - checkpoint.value
+FROM gql_csr_stats('optimizer_plan') stats, csr_acquisition_checkpoint checkpoint
+----
+1
+
+statement ok
+DROP TABLE csr_acquisition_checkpoint
+
 # A valid CSR snapshot also exposes its node-label posting lists. MATCH joins
 # those IDs back to the authoritative vertex table and no longer evaluates
 # list membership row by row.
@@ -185,7 +253,7 @@ FROM read_text('__TEST_DIR__/gql_csr_vertex_label_plan.txt')
 true	false
 
 # A fixed labeled hop whose source was bound by an earlier MATCH stage uses
-# connection-local CSR expansion. Vertex/property work remains in DuckDB.
+# database-scoped CSR expansion. Vertex/property work remains in DuckDB.
 statement ok
 PRAGMA enable_profiling = 'query_tree'
 
@@ -297,7 +365,7 @@ RETURN vertex_id, total_degree
 ----
 physical_plan	<REGEX>:.*Function: DEGREE.*
 
-# Any direct table write invalidates the connection-local snapshot. Ordinary
+# Any direct table write invalidates the database-scoped snapshot. Ordinary
 # MATCH then safely falls back instead of requiring CSR or reading stale data.
 statement ok
 UPDATE gql_data.graph_1_edges SET __gql_type = __gql_type WHERE false

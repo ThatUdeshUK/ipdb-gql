@@ -64,6 +64,25 @@ true	false	true	false	false
 statement ok
 CALL gql_build_csr('algo_graph')
 
+# Immutable derived graph storage is owned by the database instance, not the
+# client context. A second connection can inspect and consume the same full
+# projection without rebuilding it.
+query II csr_reader
+SELECT cached, build_count >= 2
+FROM gql_csr_stats('algo_graph')
+----
+true	true
+
+query I csr_reader
+SELECT count(*) FROM system.algo.bfs('algo_graph', 1)
+----
+5
+
+query I csr_reader
+SELECT build_count = 2 FROM gql_csr_stats('algo_graph')
+----
+true
+
 query III
 SELECT vertex_count, edge_count, cached
 FROM gql_csr_stats('algo_graph')
@@ -811,6 +830,11 @@ SELECT * FROM gql_csr_stats('algo_graph')
 ----
 <REGEX>:.*CSR for table-backed graph 'algo_graph' has not been built.*
 
+statement error csr_reader
+SELECT * FROM gql_csr_stats('algo_graph')
+----
+<REGEX>:.*CSR for table-backed graph 'algo_graph' has not been built.*
+
 statement ok
 PREPARE update_graph_edge AS
 UPDATE gql_data.graph_1_edges SET __gql_type = __gql_type
@@ -890,3 +914,43 @@ query I
 SELECT count(*) FROM system.algo.bfs('algo_graph', 1, edge_label := 'express')
 ----
 1
+
+# Concurrent algorithm consumers for an uncached graph elect one builder. The
+# other database connections wait and then lease the published projection.
+query IT
+CREATE GRAPH coalesced_graph ANY
+----
+true	coalesced_graph
+
+query ITII
+COPY GRAPH coalesced_graph FROM (
+    VERTICES '__TEST_DIR__/gql_csr_algo_vertices.csv',
+    EDGES '__TEST_DIR__/gql_csr_algo_edges.csv'
+) FORMAT GRAPH
+----
+true	coalesced_graph	6	6
+
+statement ok
+CALL gql_build_csr('algo_graph')
+
+statement ok
+CREATE TEMP TABLE coalesced_build_checkpoint AS
+SELECT build_count AS value FROM gql_csr_stats('algo_graph')
+
+concurrentloop threadid 0 4
+
+query I
+SELECT count(*) FROM system.algo.bfs('coalesced_graph', 1)
+----
+5
+
+endloop
+
+query I
+SELECT stats.build_count - checkpoint.value
+FROM gql_csr_stats('coalesced_graph') stats, coalesced_build_checkpoint checkpoint
+----
+1
+
+statement ok
+DROP TABLE coalesced_build_checkpoint
