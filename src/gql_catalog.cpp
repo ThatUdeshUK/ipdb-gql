@@ -366,6 +366,15 @@ static string ReadSourceTableIdentity(Connection &connection, const TableDescrip
 	return "oid:" + to_string(ReadSourceTableOid(connection, table));
 }
 
+static uint64_t ReadReferencedDuckLakeSnapshot(Connection &connection, const string &catalog) {
+	auto result =
+	    GqlQuery(connection, "SELECT id::UBIGINT FROM " + GqlQuoteIdentifier(catalog) + ".current_snapshot()");
+	if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
+		throw InvalidInputException("DuckLake catalog '%s' did not expose a current snapshot", catalog);
+	}
+	return result->GetValue(0, 0).GetValue<uint64_t>();
+}
+
 static bool ReadSourceColumnNullable(Connection &connection, const TableDescription &table, const string &column_name) {
 	auto result =
 	    GqlQuery(connection, "SELECT is_nullable FROM duckdb_columns() WHERE lower(database_name) = " +
@@ -554,21 +563,20 @@ void GqlAttachReferencedGraphTables(Connection &connection, const string &graph_
 	}
 	string snapshot = "NULL";
 	if (source_kind == "DUCKLAKE") {
-		auto current = GqlQuery(connection, "SELECT id::UBIGINT FROM " + GqlQuoteIdentifier(vertex->database) +
-		                                        ".current_snapshot()");
-		if (current->RowCount() != 1) {
-			throw BinderException("DuckLake catalog '%s' did not expose a current snapshot", vertex->database);
-		}
-		snapshot = to_string(current->GetValue(0, 0).GetValue<uint64_t>());
+		snapshot = to_string(ReadReferencedDuckLakeSnapshot(connection, vertex->database));
+	} else if (StringUtil::CIEquals(mapping.snapshot_policy, "PINNED")) {
+		throw BinderException("SNAPSHOT_POLICY 'PINNED' requires a DuckLake source catalog attached with "
+		                      "SNAPSHOT_VERSION");
 	}
+	auto pinned_snapshot = StringUtil::CIEquals(mapping.snapshot_policy, "PINNED") ? snapshot : "NULL";
 	auto fingerprint = BuildReferencedSchemaFingerprint(connection, graph_id, source_kind);
 	GqlQuery(connection, "INSERT INTO gql_internal.graph_sources "
-	                     "(graph_id, source_kind, source_catalog, snapshot_policy, access_mode, "
+	                     "(graph_id, source_kind, source_catalog, snapshot_policy, pinned_snapshot_id, access_mode, "
 	                     "registered_snapshot_id, last_validated_snapshot_id, schema_fingerprint) VALUES (" +
 	                         to_string(graph_id) + ", " + GqlQuoteLiteral(source_kind) + ", " +
 	                         GqlQuoteLiteral(vertex->database) + ", " + GqlQuoteLiteral(mapping.snapshot_policy) +
-	                         ", " + GqlQuoteLiteral(mapping.access_mode) + ", " + snapshot + ", " +
-	                         (mapping.validate ? snapshot : "NULL") + ", " + GqlQuoteLiteral(fingerprint) + ")");
+	                         ", " + pinned_snapshot + ", " + GqlQuoteLiteral(mapping.access_mode) + ", " + snapshot +
+	                         ", " + (mapping.validate ? snapshot : "NULL") + ", " + GqlQuoteLiteral(fingerprint) + ")");
 	GqlQuery(connection, "UPDATE gql_internal.graph_storage SET storage_mode = 'TABLE_BACKED', default_catalog = " +
 	                         GqlQuoteLiteral(vertex->database) +
 	                         ", default_schema = " + GqlQuoteLiteral(vertex->schema) +
@@ -683,17 +691,34 @@ bool GqlTryLoadTableGraph(ClientContext &context, const string &graph_name, GqlT
 	}
 	result.edge_source_column = ReadSingleColumn(endpoints->GetValue(2, 0), "edge source");
 	result.edge_target_column = ReadSingleColumn(endpoints->GetValue(3, 0), "edge destination");
-	auto source = GqlQuery(connection, "SELECT source_kind, source_catalog, snapshot_policy, access_mode, "
-	                                   "schema_fingerprint FROM "
+	auto source = GqlQuery(connection, "SELECT source_kind, source_catalog, snapshot_policy, pinned_snapshot_id, "
+	                                   "access_mode, schema_fingerprint FROM "
 	                                   "gql_internal.graph_sources WHERE graph_id = " +
 	                                       to_string(result.graph_id));
 	if (source->RowCount() == 1) {
 		result.source_kind = source->GetValue(0, 0).GetValue<string>();
 		result.source_catalog = source->GetValue(1, 0).GetValue<string>();
 		result.snapshot_policy = source->GetValue(2, 0).GetValue<string>();
-		result.access_mode = source->GetValue(3, 0).GetValue<string>();
-		auto registered_fingerprint = source->GetValue(4, 0).GetValue<string>();
+		if (!source->GetValue(3, 0).IsNull()) {
+			result.has_pinned_snapshot = true;
+			result.pinned_snapshot_id = source->GetValue(3, 0).GetValue<uint64_t>();
+		}
+		result.access_mode = source->GetValue(4, 0).GetValue<string>();
+		auto registered_fingerprint = source->GetValue(5, 0).GetValue<string>();
 		try {
+			if (StringUtil::CIEquals(result.snapshot_policy, "PINNED")) {
+				if (!StringUtil::CIEquals(result.source_kind, "DUCKLAKE") || !result.has_pinned_snapshot) {
+					throw InvalidInputException("Pinned graph '%s' has incomplete DuckLake snapshot metadata",
+					                            graph_name);
+				}
+				auto observed = ReadReferencedDuckLakeSnapshot(connection, result.source_catalog);
+				if (observed != result.pinned_snapshot_id) {
+					throw InvalidInputException(
+					    "Pinned graph '%s' requires DuckLake catalog '%s' attached with SNAPSHOT_VERSION %llu; "
+					    "observed snapshot %llu",
+					    graph_name, result.source_catalog, result.pinned_snapshot_id, observed);
+				}
+			}
 			auto current_fingerprint =
 			    BuildReferencedSchemaFingerprint(connection, result.graph_id, result.source_kind);
 			if (registered_fingerprint != current_fingerprint) {

@@ -1,0 +1,61 @@
+# name: test/sql/gql_catalog_migration.test
+# description: Upgrade preview graph source metadata without losing existing rows
+# group: [gql]
+
+load __TEST_DIR__/gql_catalog_migration.db
+
+require duckgql
+
+statement ok
+CREATE SCHEMA gql_internal
+
+statement ok
+CREATE TABLE gql_internal.graph_sources (
+    graph_id UBIGINT PRIMARY KEY,
+    source_kind VARCHAR NOT NULL,
+    source_catalog VARCHAR NOT NULL,
+    snapshot_policy VARCHAR NOT NULL,
+    access_mode VARCHAR NOT NULL,
+    registered_snapshot_id UBIGINT,
+    last_validated_snapshot_id UBIGINT,
+    schema_fingerprint VARCHAR NOT NULL,
+    CHECK (source_kind IN ('DUCKDB', 'DUCKLAKE')),
+    CHECK (snapshot_policy = 'LIVE'),
+    CHECK (access_mode = 'READ_ONLY')
+)
+
+statement ok
+INSERT INTO gql_internal.graph_sources VALUES
+    (42, 'DUCKLAKE', 'lake', 'LIVE', 'READ_ONLY', 7, 7, 'preview-fingerprint')
+
+query IT
+CREATE GRAPH migration_probe ANY
+----
+true	migration_probe
+
+query TTTIIT
+SELECT source_kind, snapshot_policy, pinned_snapshot_id,
+       registered_snapshot_id, last_validated_snapshot_id, schema_fingerprint
+FROM gql_internal.graph_sources
+WHERE graph_id = 42
+----
+DUCKLAKE	LIVE	NULL	7	7	preview-fingerprint
+
+query I
+SELECT count(*)
+FROM duckdb_columns()
+WHERE schema_name = 'gql_internal'
+  AND table_name = 'graph_sources'
+  AND column_name = 'pinned_snapshot_id'
+----
+1
+
+statement error
+INSERT INTO gql_internal.graph_sources VALUES
+    (43, 'DUCKLAKE', 'lake', 'PINNED', NULL, 'READ_ONLY', 7, 7, 'invalid')
+----
+<REGEX>:.*CHECK constraint failed.*
+
+statement ok
+INSERT INTO gql_internal.graph_sources VALUES
+    (43, 'DUCKLAKE', 'lake', 'PINNED', 7, 'READ_ONLY', 7, 7, 'valid')

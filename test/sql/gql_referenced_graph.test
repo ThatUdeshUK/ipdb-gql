@@ -187,6 +187,42 @@ FROM gql_csr_stats('social')
 ----
 lake	2
 
+# PINNED graphs require the attached DuckLake alias to expose the exact
+# snapshot captured by the graph metadata. They never silently fall forward.
+statement ok
+UPDATE gql_internal.graph_sources
+SET snapshot_policy = 'PINNED', pinned_snapshot_id = 2
+WHERE graph_id = (SELECT graph_id FROM gql_internal.graphs WHERE graph_name = 'social')
+
+query II
+MATCH (p:Person)
+RETURN p.id, p.age
+ORDER BY p.id
+----
+1	42
+2	37
+
+statement ok
+UPDATE lake.main.snapshot_control SET id = 3
+
+statement error
+MATCH (p:Person) RETURN p.id
+----
+<REGEX>:.*requires DuckLake catalog 'lake' attached with SNAPSHOT_VERSION 2; observed snapshot 3.*
+
+statement error
+SELECT * FROM system.algo.pagerank('social')
+----
+<REGEX>:.*requires DuckLake catalog 'lake' attached with SNAPSHOT_VERSION 2; observed snapshot 3.*
+
+statement ok
+UPDATE lake.main.snapshot_control SET id = 2
+
+statement ok
+UPDATE gql_internal.graph_sources
+SET snapshot_policy = 'LIVE', pinned_snapshot_id = NULL
+WHERE graph_id = (SELECT graph_id FROM gql_internal.graphs WHERE graph_name = 'social')
+
 # Unmapped source columns are private and may evolve without invalidating the
 # graph-visible schema fingerprint.
 statement ok

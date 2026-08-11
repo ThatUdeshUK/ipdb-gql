@@ -164,7 +164,7 @@ static uint64_t ReadDuckLakeSnapshot(Connection &connection, const string &catal
 
 static GraphVersion ReadGraphVersion(Connection &connection, const string &graph_name) {
 	auto result = GqlQuery(connection, "SELECT g.graph_id, g.graph_version, s.source_kind, s.source_catalog, "
-	                                   "s.snapshot_policy FROM gql_internal.graphs g LEFT JOIN "
+	                                   "s.snapshot_policy, s.pinned_snapshot_id FROM gql_internal.graphs g LEFT JOIN "
 	                                   "gql_internal.graph_sources s USING (graph_id) WHERE g.graph_name = " +
 	                                       GqlQuoteLiteral(graph_name));
 	if (result->RowCount() == 0) {
@@ -175,12 +175,25 @@ static GraphVersion ReadGraphVersion(Connection &connection, const string &graph
 	version.graph_version = result->GetValue(1, 0).GetValue<uint64_t>();
 	if (!result->GetValue(2, 0).IsNull() &&
 	    StringUtil::CIEquals(result->GetValue(2, 0).GetValue<string>(), "DUCKLAKE")) {
-		if (result->GetValue(3, 0).IsNull() || result->GetValue(4, 0).IsNull() ||
-		    !StringUtil::CIEquals(result->GetValue(4, 0).GetValue<string>(), "LIVE")) {
+		if (result->GetValue(3, 0).IsNull() || result->GetValue(4, 0).IsNull()) {
 			throw InvalidInputException("DuckLake graph '%s' has incomplete snapshot metadata", graph_name);
 		}
 		version.source_catalog = result->GetValue(3, 0).GetValue<string>();
-		version.source_snapshot_id = ReadDuckLakeSnapshot(connection, version.source_catalog);
+		auto policy = result->GetValue(4, 0).GetValue<string>();
+		auto observed_snapshot = ReadDuckLakeSnapshot(connection, version.source_catalog);
+		if (StringUtil::CIEquals(policy, "LIVE")) {
+			version.source_snapshot_id = observed_snapshot;
+		} else if (StringUtil::CIEquals(policy, "PINNED") && !result->GetValue(5, 0).IsNull()) {
+			version.source_snapshot_id = result->GetValue(5, 0).GetValue<uint64_t>();
+			if (observed_snapshot != version.source_snapshot_id) {
+				throw InvalidInputException(
+				    "Pinned graph '%s' requires DuckLake catalog '%s' attached with SNAPSHOT_VERSION %llu; "
+				    "observed snapshot %llu",
+				    graph_name, version.source_catalog, version.source_snapshot_id, observed_snapshot);
+			}
+		} else {
+			throw InvalidInputException("DuckLake graph '%s' has invalid snapshot policy metadata", graph_name);
+		}
 		version.has_source_snapshot = true;
 	}
 	return version;

@@ -1024,8 +1024,8 @@ public:
 				first = false;
 				if (ConsumeKeyword("SNAPSHOT_POLICY")) {
 					result.snapshot_policy = StringUtil::Upper(ParseString());
-					if (result.snapshot_policy != "LIVE") {
-						Error("only SNAPSHOT_POLICY 'LIVE' is supported");
+					if (result.snapshot_policy != "LIVE" && result.snapshot_policy != "PINNED") {
+						Error("SNAPSHOT_POLICY must be 'LIVE' or 'PINNED'");
 					}
 				} else if (ConsumeKeyword("ACCESS_MODE")) {
 					result.access_mode = StringUtil::Upper(ParseString());

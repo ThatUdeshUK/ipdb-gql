@@ -189,10 +189,48 @@ void GqlEnsureStorage(Connection &connection) {
 	GqlQuery(connection, "CREATE TABLE IF NOT EXISTS gql_internal.graph_sources ("
 	                     "graph_id UBIGINT PRIMARY KEY, source_kind VARCHAR NOT NULL, "
 	                     "source_catalog VARCHAR NOT NULL, snapshot_policy VARCHAR NOT NULL, "
-	                     "access_mode VARCHAR NOT NULL, registered_snapshot_id UBIGINT, "
+	                     "pinned_snapshot_id UBIGINT, access_mode VARCHAR NOT NULL, registered_snapshot_id UBIGINT, "
 	                     "last_validated_snapshot_id UBIGINT, schema_fingerprint VARCHAR NOT NULL, "
 	                     "CHECK (source_kind IN ('DUCKDB', 'DUCKLAKE')), "
-	                     "CHECK (snapshot_policy = 'LIVE'), CHECK (access_mode = 'READ_ONLY'))");
+	                     "CHECK (snapshot_policy IN ('LIVE', 'PINNED')), CHECK (access_mode = 'READ_ONLY'), "
+	                     "CHECK ((snapshot_policy = 'LIVE' AND pinned_snapshot_id IS NULL) OR "
+	                     "(snapshot_policy = 'PINNED' AND pinned_snapshot_id IS NOT NULL)))");
+	auto pinned_snapshot_column =
+	    GqlQuery(connection, "SELECT count(*) FROM duckdb_columns() WHERE database_name = current_database() AND "
+	                         "schema_name = 'gql_internal' AND "
+	                         "table_name = 'graph_sources' AND column_name = 'pinned_snapshot_id'");
+	if (pinned_snapshot_column->GetValue(0, 0).GetValue<int64_t>() == 0) {
+		const bool own_transaction = !connection.HasActiveTransaction();
+		if (own_transaction) {
+			connection.BeginTransaction();
+		}
+		try {
+			GqlQuery(connection, "CREATE TABLE gql_internal.graph_sources_v2 ("
+			                     "graph_id UBIGINT PRIMARY KEY, source_kind VARCHAR NOT NULL, "
+			                     "source_catalog VARCHAR NOT NULL, snapshot_policy VARCHAR NOT NULL, "
+			                     "pinned_snapshot_id UBIGINT, access_mode VARCHAR NOT NULL, "
+			                     "registered_snapshot_id UBIGINT, last_validated_snapshot_id UBIGINT, "
+			                     "schema_fingerprint VARCHAR NOT NULL, "
+			                     "CHECK (source_kind IN ('DUCKDB', 'DUCKLAKE')), "
+			                     "CHECK (snapshot_policy IN ('LIVE', 'PINNED')), CHECK (access_mode = 'READ_ONLY'), "
+			                     "CHECK ((snapshot_policy = 'LIVE' AND pinned_snapshot_id IS NULL) OR "
+			                     "(snapshot_policy = 'PINNED' AND pinned_snapshot_id IS NOT NULL)))");
+			GqlQuery(connection, "INSERT INTO gql_internal.graph_sources_v2 "
+			                     "SELECT graph_id, source_kind, source_catalog, snapshot_policy, NULL, access_mode, "
+			                     "registered_snapshot_id, last_validated_snapshot_id, schema_fingerprint "
+			                     "FROM gql_internal.graph_sources");
+			GqlQuery(connection, "DROP TABLE gql_internal.graph_sources");
+			GqlQuery(connection, "ALTER TABLE gql_internal.graph_sources_v2 RENAME TO graph_sources");
+			if (own_transaction) {
+				connection.Commit();
+			}
+		} catch (...) {
+			if (own_transaction && connection.HasActiveTransaction()) {
+				connection.Rollback();
+			}
+			throw;
+		}
+	}
 	GqlQuery(connection, "CREATE TABLE IF NOT EXISTS gql_internal.graph_element_type_mappings ("
 	                     "element_table_id UBIGINT NOT NULL, schema_element_id UBIGINT NOT NULL, "
 	                     "discriminator_kind VARCHAR NOT NULL, discriminator_value VARCHAR, "

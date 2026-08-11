@@ -32,6 +32,8 @@ struct GqlTableGraphBinding {
 	string source_kind;
 	string source_catalog;
 	string snapshot_policy;
+	bool has_pinned_snapshot = false;
+	uint64_t pinned_snapshot_id = 0;
 	string access_mode;
 };
 
