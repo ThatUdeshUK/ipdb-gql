@@ -309,26 +309,34 @@ LOAD duckgql;
 ATTACH 'ducklake:lakehouse.ducklake' AS lake;
 
 CREATE GRAPH social TYPED {
-    (Person :Person {id INT64 NOT NULL, name STRING, age INT64}),
-    (Person)-[:KNOWS {id INT64 NOT NULL, since INT32}]->(Person)
+    (Customer :Customer {id INT64 NOT NULL, name STRING}),
+    (ProductNode :ProductNode {id INT64 NOT NULL, name STRING, price FLOAT64}),
+    (Customer)-[:BOUGHT {id INT64 NOT NULL, quantity INT32}]->(ProductNode)
 }
 FROM TABLES (
-    VERTEX TABLE lake.main.person
-        MAP TO NODE TYPE Person
-        KEY (person_id)
+    VERTEX TABLE lake.main.customers
+        MAP TO NODE TYPE Customer
+        KEY (customer_id)
         PROPERTIES (
-            person_id AS id,
-            full_name AS name,
-            age_years AS age
+            customer_id AS id,
+            customer_name AS name
         ),
-    EDGE TABLE lake.main.person_knows
-        MAP TO EDGE TYPE KNOWS
-        KEY (relationship_id)
-        SOURCE (src_person_id) REFERENCES NODE TYPE Person
-        DESTINATION (dst_person_id) REFERENCES NODE TYPE Person
+    VERTEX TABLE lake.main.products
+        MAP TO NODE TYPE ProductNode
+        KEY (product_id)
         PROPERTIES (
-            relationship_id AS id,
-            since_year AS since
+            product_id AS id,
+            product_name AS name,
+            price AS price
+        ),
+    EDGE TABLE lake.main.orders
+        MAP TO EDGE TYPE BOUGHT
+        KEY (order_id)
+        SOURCE (customer_id) REFERENCES NODE TYPE Customer
+        DESTINATION (product_id) REFERENCES NODE TYPE ProductNode
+        PROPERTIES (
+            order_id AS id,
+            quantity AS quantity
         )
 )
 OPTIONS (
@@ -339,8 +347,8 @@ OPTIONS (
 
 SESSION SET GRAPH social;
 
-MATCH (a:Person)-[e:KNOWS]->(b:Person)
-RETURN a.name, b.name, e.since;
+MATCH (customer:Customer)-[order:BOUGHT]->(product:ProductNode)
+RETURN customer.name, product.name, order.quantity;
 
 CALL algo.pagerank('social')
 YIELD vertex_id, rank
@@ -348,9 +356,13 @@ RETURN vertex_id, rank
 ORDER BY rank DESC;
 ```
 
-Only mapped columns are visible through GQL. With `SNAPSHOT_POLICY 'LIVE'`,
-queries see the current DuckLake snapshot, including newly committed data.
-Graph algorithms refresh automatically when that snapshot changes.
+Only mapped columns are visible through GQL. Each vertex table maps one node
+type; edge endpoints resolve through the named node-type mappings. Source keys
+remain the values returned by `element_id`, so vertex keys must be unique across
+all mapped vertex tables (and edge keys across all mapped edge tables). With
+`SNAPSHOT_POLICY 'LIVE'`, queries see the current DuckLake snapshot, including
+newly committed data. Graph algorithms refresh automatically when that snapshot
+changes.
 
 For reproducible analysis, attach DuckLake at a specific version and register
 the graph with a pinned policy:
@@ -372,8 +384,10 @@ The pinned graph continues to read snapshot 42. If `lake` is attached at a
 different snapshot, DuckGQL asks you to reattach it with the required
 `SNAPSHOT_VERSION` instead of returning different results.
 
-DuckLake-backed graphs are currently read-only and support one vertex table
-and one edge table from the same DuckLake catalog, using integer keys.
+DuckLake-backed graphs are currently read-only and support multiple vertex and
+edge tables from the same DuckLake catalog, using integer keys. A node type may
+be mapped by one vertex table; joining several physical tables into one node
+record is not yet supported.
 
 ## Storage model
 
@@ -467,9 +481,10 @@ zero-copy, read-only alternative.
 - Path modes, searches, shortest-path groups, query composition, procedure
   semantics, named graph types, typed storage enforcement, and the complete
   GQL value/type system remain incomplete.
-- Referenced graphs currently support one vertex table and one edge table,
-  integer identity, static types, live snapshots, and read-only access. Pinned
-  snapshots and heterogeneous multi-table projections are not yet supported.
+- Referenced graphs support heterogeneous vertex and edge table mappings,
+  graph-wide integer identity, static types, live or pinned snapshots, and
+  read-only access. Composite/string identities, multi-table joins for one node
+  record, mapping predicates, and write-through mutations are not yet supported.
 
 The machine-readable status is
 [`test/conformance/iso-gql-2024.tsv`](test/conformance/iso-gql-2024.tsv). The

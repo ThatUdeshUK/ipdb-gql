@@ -21,6 +21,9 @@ struct GqlElementTableBinding {
 	vector<string> static_labels;
 	unordered_map<string, string> property_columns;
 	unordered_map<string, string> property_indexes;
+	//! Non-empty for a heterogeneous referenced graph. This SELECT is a
+	//! canonical, zero-copy union over the physical element tables.
+	string relation_sql;
 };
 
 struct GqlTableGraphBinding {
@@ -42,19 +45,20 @@ struct GqlPropertyColumnMapping {
 	string property_name;
 };
 
-struct GqlReferencedTableMapping {
-	string vertex_table;
-	string vertex_schema_type;
-	string vertex_key;
-	vector<GqlPropertyColumnMapping> vertex_properties;
-	string edge_table;
-	string edge_schema_type;
-	string edge_key;
-	string edge_source;
-	string edge_target;
+struct GqlReferencedElementMapping {
+	string kind;
+	string table;
+	string schema_type;
+	string key;
+	string source;
+	string target;
 	string source_schema_type;
 	string target_schema_type;
-	vector<GqlPropertyColumnMapping> edge_properties;
+	vector<GqlPropertyColumnMapping> properties;
+};
+
+struct GqlReferencedTableMapping {
+	vector<GqlReferencedElementMapping> elements;
 	string snapshot_policy = "LIVE";
 	string access_mode = "READ_ONLY";
 	bool validate = true;

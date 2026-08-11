@@ -291,3 +291,152 @@ query I
 SELECT count(*) FROM gql_internal.graphs WHERE graph_name = 'invalid_mapping'
 ----
 0
+
+# Multiple physical vertex tables form one heterogeneous logical vertex
+# relation. Source keys remain element IDs, so their values share one graph-wide
+# namespace. Edge endpoints resolve through the declared node types.
+statement ok
+CREATE TABLE lake.main.customer (
+    customer_id BIGINT NOT NULL,
+    customer_name VARCHAR
+)
+
+statement ok
+CREATE TABLE lake.main.product (
+    product_id BIGINT NOT NULL,
+    product_name VARCHAR,
+    price DOUBLE
+)
+
+statement ok
+CREATE TABLE lake.main.bought (
+    order_id BIGINT NOT NULL,
+    customer_id BIGINT NOT NULL,
+    product_id BIGINT NOT NULL,
+    quantity INTEGER
+)
+
+statement ok
+INSERT INTO lake.main.customer VALUES (1, 'Ada'), (2, 'Grace')
+
+statement ok
+INSERT INTO lake.main.product VALUES (101, 'Keyboard', 99.5), (102, 'Mouse', 25.0)
+
+statement ok
+INSERT INTO lake.main.bought VALUES (1001, 1, 101, 1), (1002, 2, 102, 2)
+
+query IT
+CREATE GRAPH commerce TYPED {
+    (Customer :Customer {id INT64 NOT NULL, name STRING}),
+    (Item :Item {id INT64 NOT NULL, name STRING, price FLOAT64}),
+    (Customer)-[:BOUGHT {id INT64 NOT NULL, quantity INT32}]->(Item)
+}
+FROM TABLES (
+    VERTEX TABLE lake.main.customer
+        MAP TO NODE TYPE Customer
+        KEY (customer_id)
+        PROPERTIES (customer_id AS id, customer_name AS name),
+    VERTEX TABLE lake.main.product
+        MAP TO NODE TYPE Item
+        KEY (product_id)
+        PROPERTIES (product_id AS id, product_name AS name, price AS price),
+    EDGE TABLE lake.main.bought
+        MAP TO EDGE TYPE BOUGHT
+        KEY (order_id)
+        SOURCE (customer_id) REFERENCES NODE TYPE Customer
+        DESTINATION (product_id) REFERENCES NODE TYPE Item
+        PROPERTIES (order_id AS id, quantity AS quantity)
+)
+OPTIONS (SNAPSHOT_POLICY 'LIVE', ACCESS_MODE 'READ_ONLY', VALIDATE TRUE)
+----
+true	commerce
+
+query II
+SELECT count(*), count(DISTINCT element_kind)
+FROM gql_internal.graph_element_tables et
+JOIN gql_internal.graphs g USING (graph_id)
+WHERE g.graph_name = 'commerce'
+----
+3	2
+
+statement ok
+SESSION SET GRAPH commerce
+
+query TTI
+MATCH (c:Customer)-[b:BOUGHT]->(p:Item)
+RETURN c.name, p.name, b.quantity
+ORDER BY c.name
+----
+Ada	Keyboard	1
+Grace	Mouse	2
+
+query I
+MATCH (n)
+RETURN count(*)
+----
+4
+
+statement ok
+CALL gql_build_csr('commerce')
+
+query II
+SELECT vertex_count, edge_count FROM gql_csr_stats('commerce')
+----
+4	2
+
+query I
+SELECT count(*) FROM system.algo.pagerank('commerce')
+----
+4
+
+# LIVE mappings scan newly committed rows without recreating the graph.
+statement ok
+INSERT INTO lake.main.product VALUES (103, 'Monitor', 350.0)
+
+statement ok
+INSERT INTO lake.main.bought VALUES (1003, 1, 103, 1)
+
+query T
+MATCH (:Customer)-[:BOUGHT]->(p:Item)
+RETURN p.name
+ORDER BY p.name
+----
+Keyboard
+Monitor
+Mouse
+
+statement ok
+DROP GRAPH commerce
+
+# Source keys from different vertex tables may not collide because
+# element_id(node) continues to expose the source key.
+statement ok
+CREATE TABLE lake.main.duplicate_product (product_id BIGINT NOT NULL)
+
+statement ok
+INSERT INTO lake.main.duplicate_product VALUES (1), (101), (102), (103)
+
+statement error
+CREATE GRAPH duplicate_ids TYPED {
+    (Customer :Customer {id INT64 NOT NULL}),
+    (Item :Item {id INT64 NOT NULL}),
+    (Customer)-[:BOUGHT {id INT64 NOT NULL}]->(Item)
+}
+FROM TABLES (
+    VERTEX TABLE lake.main.customer
+        MAP TO NODE TYPE Customer KEY (customer_id) PROPERTIES (customer_id AS id),
+    VERTEX TABLE lake.main.duplicate_product
+        MAP TO NODE TYPE Item KEY (product_id) PROPERTIES (product_id AS id),
+    EDGE TABLE lake.main.bought
+        MAP TO EDGE TYPE BOUGHT KEY (order_id)
+        SOURCE (customer_id) REFERENCES NODE TYPE Customer
+        DESTINATION (product_id) REFERENCES NODE TYPE Item
+        PROPERTIES (order_id AS id)
+)
+----
+<REGEX>:.*vertex keys must be unique across all mapped tables.*
+
+query I
+SELECT count(*) FROM gql_internal.graphs WHERE graph_name = 'duplicate_ids'
+----
+0

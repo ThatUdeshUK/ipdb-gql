@@ -109,6 +109,9 @@ void GqlNotifyCsrPreparedWriteExecution(ClientContext &context) {
 }
 
 static string QualifiedTable(const GqlElementTableBinding &table) {
+	if (!table.relation_sql.empty()) {
+		return "(" + table.relation_sql + ")";
+	}
 	return GqlQuoteIdentifier(table.catalog_name) + "." + GqlQuoteIdentifier(table.schema_name) + "." +
 	       GqlQuoteIdentifier(table.table_name);
 }

@@ -22,6 +22,7 @@
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
@@ -497,6 +498,15 @@ static unique_ptr<TableRef> NamedTable(const string &name, const string &alias) 
 }
 
 static unique_ptr<TableRef> ElementTable(const GqlElementTableBinding &table, const string &alias) {
+	if (!table.relation_sql.empty()) {
+		Parser parser;
+		parser.ParseQuery(table.relation_sql);
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+			throw InternalException("Invalid referenced graph union relation");
+		}
+		auto statement = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+		return make_uniq<SubqueryRef>(std::move(statement), alias);
+	}
 	auto result = make_uniq<BaseTableRef>();
 	result->catalog_name = table.catalog_name;
 	result->schema_name = table.schema_name;

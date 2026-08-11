@@ -274,8 +274,7 @@ struct GqlGraphElementTableMapping {
 
 struct GqlReferencedGraphDefinition {
 	bool present = false;
-	GqlGraphElementTableMapping vertex;
-	GqlGraphElementTableMapping edge;
+	vector<GqlGraphElementTableMapping> elements;
 	string snapshot_policy = "LIVE";
 	string access_mode = "READ_ONLY";
 	bool validate = true;

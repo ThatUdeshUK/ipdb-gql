@@ -1010,10 +1010,28 @@ public:
 		ExpectKeyword("FROM");
 		ExpectKeyword("TABLES");
 		ExpectCharacter('(');
-		result.vertex = ParseElement(GqlPatternElementType::VERTEX);
-		ExpectCharacter(',');
-		result.edge = ParseElement(GqlPatternElementType::EDGE);
-		ExpectCharacter(')');
+		bool has_vertex = false;
+		bool has_edge = false;
+		while (true) {
+			GqlPatternElementType kind;
+			if (ConsumeKeyword("VERTEX")) {
+				kind = GqlPatternElementType::VERTEX;
+				has_vertex = true;
+			} else if (ConsumeKeyword("EDGE")) {
+				kind = GqlPatternElementType::EDGE;
+				has_edge = true;
+			} else {
+				Error("expected VERTEX or EDGE table mapping");
+			}
+			result.elements.push_back(ParseElement(kind));
+			if (ConsumeCharacter(')')) {
+				break;
+			}
+			ExpectCharacter(',');
+		}
+		if (!has_vertex || !has_edge) {
+			Error("FROM TABLES requires at least one VERTEX and one EDGE table mapping");
+		}
 		if (ConsumeKeyword("OPTIONS")) {
 			ExpectCharacter('(');
 			bool first = true;
@@ -1049,7 +1067,6 @@ private:
 	GqlGraphElementTableMapping ParseElement(GqlPatternElementType expected_kind) {
 		GqlGraphElementTableMapping result;
 		result.kind = expected_kind;
-		ExpectKeyword(expected_kind == GqlPatternElementType::VERTEX ? "VERTEX" : "EDGE");
 		ExpectKeyword("TABLE");
 		result.qualified_table = ParseQualifiedName();
 		ExpectKeyword("MAP");
@@ -2010,32 +2027,44 @@ ParserExtensionPlanResult GqlPlan(ParserExtensionInfo *, ClientContext &,
 		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(property_types)));
 		result.parameters.emplace_back(Value::LIST(LogicalType::BOOLEAN, std::move(property_nullables)));
 		result.parameters.emplace_back(create.referenced.present);
-		result.parameters.emplace_back(create.referenced.vertex.qualified_table);
-		result.parameters.emplace_back(create.referenced.vertex.schema_type.value);
-		result.parameters.emplace_back(create.referenced.vertex.key_column.value);
-		vector<Value> vertex_property_columns;
-		vector<Value> vertex_property_names;
-		for (const auto &property : create.referenced.vertex.properties) {
-			vertex_property_columns.emplace_back(property.source_column.value);
-			vertex_property_names.emplace_back(property.property_name.value);
+		vector<Value> mapping_kinds;
+		vector<Value> mapping_tables;
+		vector<Value> mapping_schema_types;
+		vector<Value> mapping_keys;
+		vector<Value> mapping_sources;
+		vector<Value> mapping_targets;
+		vector<Value> mapping_source_schema_types;
+		vector<Value> mapping_target_schema_types;
+		vector<Value> mapping_property_indices;
+		vector<Value> mapping_property_columns;
+		vector<Value> mapping_property_names;
+		for (idx_t mapping_index = 0; mapping_index < create.referenced.elements.size(); mapping_index++) {
+			const auto &mapping = create.referenced.elements[mapping_index];
+			mapping_kinds.emplace_back(mapping.kind == GqlPatternElementType::VERTEX ? "VERTEX" : "EDGE");
+			mapping_tables.emplace_back(mapping.qualified_table);
+			mapping_schema_types.emplace_back(mapping.schema_type.value);
+			mapping_keys.emplace_back(mapping.key_column.value);
+			mapping_sources.emplace_back(mapping.source_column.value);
+			mapping_targets.emplace_back(mapping.target_column.value);
+			mapping_source_schema_types.emplace_back(mapping.source_schema_type.value);
+			mapping_target_schema_types.emplace_back(mapping.target_schema_type.value);
+			for (const auto &property : mapping.properties) {
+				mapping_property_indices.emplace_back(Value::UBIGINT(mapping_index));
+				mapping_property_columns.emplace_back(property.source_column.value);
+				mapping_property_names.emplace_back(property.property_name.value);
+			}
 		}
-		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(vertex_property_columns)));
-		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(vertex_property_names)));
-		result.parameters.emplace_back(create.referenced.edge.qualified_table);
-		result.parameters.emplace_back(create.referenced.edge.schema_type.value);
-		result.parameters.emplace_back(create.referenced.edge.key_column.value);
-		result.parameters.emplace_back(create.referenced.edge.source_column.value);
-		result.parameters.emplace_back(create.referenced.edge.target_column.value);
-		result.parameters.emplace_back(create.referenced.edge.source_schema_type.value);
-		result.parameters.emplace_back(create.referenced.edge.target_schema_type.value);
-		vector<Value> edge_property_columns;
-		vector<Value> edge_property_names;
-		for (const auto &property : create.referenced.edge.properties) {
-			edge_property_columns.emplace_back(property.source_column.value);
-			edge_property_names.emplace_back(property.property_name.value);
-		}
-		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(edge_property_columns)));
-		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(edge_property_names)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(mapping_kinds)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(mapping_tables)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(mapping_schema_types)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(mapping_keys)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(mapping_sources)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(mapping_targets)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(mapping_source_schema_types)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(mapping_target_schema_types)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::UBIGINT, std::move(mapping_property_indices)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(mapping_property_columns)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(mapping_property_names)));
 		result.parameters.emplace_back(create.referenced.snapshot_policy);
 		result.parameters.emplace_back(create.referenced.access_mode);
 		result.parameters.emplace_back(create.referenced.validate);

@@ -656,7 +656,7 @@ static vector<bool> ReadCreateGraphBooleans(const Value &value) {
 
 static unique_ptr<FunctionData> CreateGraphBind(ClientContext &, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
-	if (input.inputs.size() != 34 || input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull() ||
+	if (input.inputs.size() != 31 || input.inputs[0].IsNull() || input.inputs[1].IsNull() || input.inputs[2].IsNull() ||
 	    input.inputs[3].IsNull()) {
 		throw BinderException("Invalid CREATE GRAPH schema payload");
 	}
@@ -760,32 +760,46 @@ static unique_ptr<FunctionData> CreateGraphBind(ClientContext &, TableFunctionBi
 		if (!typed) {
 			throw BinderException("Referenced graphs require an inline typed schema");
 		}
-		referenced_mapping.vertex_table = input.inputs[17].GetValue<string>();
-		referenced_mapping.vertex_schema_type = input.inputs[18].GetValue<string>();
-		referenced_mapping.vertex_key = input.inputs[19].GetValue<string>();
-		auto vertex_columns = ReadCreateGraphStrings(input.inputs[20]);
-		auto vertex_properties = ReadCreateGraphStrings(input.inputs[21]);
-		referenced_mapping.edge_table = input.inputs[22].GetValue<string>();
-		referenced_mapping.edge_schema_type = input.inputs[23].GetValue<string>();
-		referenced_mapping.edge_key = input.inputs[24].GetValue<string>();
-		referenced_mapping.edge_source = input.inputs[25].GetValue<string>();
-		referenced_mapping.edge_target = input.inputs[26].GetValue<string>();
-		referenced_mapping.source_schema_type = input.inputs[27].GetValue<string>();
-		referenced_mapping.target_schema_type = input.inputs[28].GetValue<string>();
-		auto edge_columns = ReadCreateGraphStrings(input.inputs[29]);
-		auto edge_properties = ReadCreateGraphStrings(input.inputs[30]);
-		referenced_mapping.snapshot_policy = input.inputs[31].GetValue<string>();
-		referenced_mapping.access_mode = input.inputs[32].GetValue<string>();
-		referenced_mapping.validate = input.inputs[33].GetValue<bool>();
-		if (vertex_columns.size() != vertex_properties.size() || edge_columns.size() != edge_properties.size() ||
-		    referenced_mapping.vertex_table.empty() || referenced_mapping.edge_table.empty()) {
+		auto mapping_kinds = ReadCreateGraphStrings(input.inputs[17]);
+		auto mapping_tables = ReadCreateGraphStrings(input.inputs[18]);
+		auto mapping_schema_types = ReadCreateGraphStrings(input.inputs[19]);
+		auto mapping_keys = ReadCreateGraphStrings(input.inputs[20]);
+		auto mapping_sources = ReadCreateGraphStrings(input.inputs[21]);
+		auto mapping_targets = ReadCreateGraphStrings(input.inputs[22]);
+		auto mapping_source_schema_types = ReadCreateGraphStrings(input.inputs[23]);
+		auto mapping_target_schema_types = ReadCreateGraphStrings(input.inputs[24]);
+		auto mapping_property_indices = ReadCreateGraphIndices(input.inputs[25]);
+		auto mapping_property_columns = ReadCreateGraphStrings(input.inputs[26]);
+		auto mapping_property_names = ReadCreateGraphStrings(input.inputs[27]);
+		referenced_mapping.snapshot_policy = input.inputs[28].GetValue<string>();
+		referenced_mapping.access_mode = input.inputs[29].GetValue<string>();
+		referenced_mapping.validate = input.inputs[30].GetValue<bool>();
+		auto mapping_count = mapping_kinds.size();
+		if (mapping_count == 0 || mapping_tables.size() != mapping_count ||
+		    mapping_schema_types.size() != mapping_count || mapping_keys.size() != mapping_count ||
+		    mapping_sources.size() != mapping_count || mapping_targets.size() != mapping_count ||
+		    mapping_source_schema_types.size() != mapping_count ||
+		    mapping_target_schema_types.size() != mapping_count ||
+		    mapping_property_indices.size() != mapping_property_columns.size() ||
+		    mapping_property_indices.size() != mapping_property_names.size()) {
 			throw BinderException("Invalid referenced graph mapping payload");
 		}
-		for (idx_t index = 0; index < vertex_columns.size(); index++) {
-			referenced_mapping.vertex_properties.push_back({vertex_columns[index], vertex_properties[index]});
+		for (idx_t index = 0; index < mapping_count; index++) {
+			if ((mapping_kinds[index] != "VERTEX" && mapping_kinds[index] != "EDGE") ||
+			    mapping_tables[index].empty() || mapping_schema_types[index].empty() || mapping_keys[index].empty()) {
+				throw BinderException("Invalid referenced graph element mapping payload");
+			}
+			referenced_mapping.elements.push_back(
+			    {mapping_kinds[index], mapping_tables[index], mapping_schema_types[index], mapping_keys[index],
+			     mapping_sources[index], mapping_targets[index], mapping_source_schema_types[index],
+			     mapping_target_schema_types[index], {}});
 		}
-		for (idx_t index = 0; index < edge_columns.size(); index++) {
-			referenced_mapping.edge_properties.push_back({edge_columns[index], edge_properties[index]});
+		for (idx_t index = 0; index < mapping_property_indices.size(); index++) {
+			if (mapping_property_indices[index] >= mapping_count) {
+				throw BinderException("Invalid referenced graph property mapping index");
+			}
+			referenced_mapping.elements[mapping_property_indices[index]].properties.push_back(
+			    {mapping_property_columns[index], mapping_property_names[index]});
 		}
 	}
 
@@ -1349,10 +1363,11 @@ TableFunction GqlCreateGraphFunction() {
 	                        LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::BOOLEAN)},
 	                       CreateGraph);
 	function.arguments.insert(function.arguments.end(),
-	                          {LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                          {LogicalType::BOOLEAN, LogicalType::LIST(LogicalType::VARCHAR),
 	                           LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR),
-	                           LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                           LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                           LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR),
+	                           LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR),
+	                           LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::UBIGINT),
 	                           LogicalType::LIST(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR),
 	                           LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN});
 	function.bind = CreateGraphBind;
