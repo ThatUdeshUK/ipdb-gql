@@ -217,6 +217,368 @@ void GqlAttachManagedGraphTables(Connection &connection, const string &graph_nam
 	                         to_string(graph_id));
 }
 
+static bool IsReferencedKeyType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static uint64_t FindSchemaElement(Connection &connection, uint64_t graph_id, const string &kind,
+                                  const string &type_name) {
+	auto result = GqlQuery(connection, "SELECT schema_element_id FROM gql_internal.graph_schema_elements WHERE "
+	                                   "graph_id = " +
+	                                       to_string(graph_id) + " AND element_kind = " + GqlQuoteLiteral(kind) +
+	                                       " AND lower(type_name) = " + GqlQuoteLiteral(StringUtil::Lower(type_name)));
+	if (result->RowCount() != 1) {
+		throw BinderException("Referenced graph mapping names unknown %s type '%s'", StringUtil::Lower(kind),
+		                      type_name);
+	}
+	return result->GetValue(0, 0).GetValue<uint64_t>();
+}
+
+static void InsertStaticLabels(Connection &connection, uint64_t element_table_id, uint64_t schema_element_id,
+                               const string &fallback) {
+	auto labels = GqlQuery(connection, "SELECT label_name FROM gql_internal.graph_schema_labels WHERE "
+	                                   "schema_element_id = " +
+	                                       to_string(schema_element_id) + " ORDER BY label_ordinal");
+	if (labels->RowCount() == 0) {
+		GqlQuery(connection, "INSERT INTO gql_internal.graph_label_mappings "
+		                     "(element_table_id, label_name, mapping_kind) VALUES (" +
+		                         to_string(element_table_id) + ", " + GqlQuoteLiteral(fallback) + ", 'STATIC')");
+		return;
+	}
+	for (idx_t row = 0; row < labels->RowCount(); row++) {
+		GqlQuery(connection, "INSERT INTO gql_internal.graph_label_mappings "
+		                     "(element_table_id, label_name, mapping_kind) VALUES (" +
+		                         to_string(element_table_id) + ", " +
+		                         GqlQuoteLiteral(labels->GetValue(0, row).GetValue<string>()) + ", 'STATIC')");
+	}
+}
+
+static void InsertReferencedProperties(Connection &connection, uint64_t element_table_id, uint64_t schema_element_id,
+                                       const TableDescription &table, const vector<GqlPropertyColumnMapping> &mappings,
+                                       bool validate) {
+	auto properties = GqlQuery(connection, "SELECT property_name, gql_type, nullable FROM "
+	                                       "gql_internal.graph_schema_properties WHERE schema_element_id = " +
+	                                           to_string(schema_element_id) + " ORDER BY property_ordinal");
+	if (properties->RowCount() != mappings.size()) {
+		throw BinderException("Referenced table %s.%s must map every declared property exactly once", table.schema,
+		                      table.table);
+	}
+	unordered_set<string> mapped_properties;
+	for (const auto &mapping : mappings) {
+		auto normalized = StringUtil::Lower(mapping.property_name);
+		if (!mapped_properties.insert(normalized).second) {
+			throw BinderException("Duplicate referenced property mapping '%s'", mapping.property_name);
+		}
+		idx_t schema_row = DConstants::INVALID_INDEX;
+		for (idx_t row = 0; row < properties->RowCount(); row++) {
+			if (StringUtil::CIEquals(properties->GetValue(0, row).GetValue<string>(), mapping.property_name)) {
+				schema_row = row;
+				break;
+			}
+		}
+		if (schema_row == DConstants::INVALID_INDEX) {
+			throw BinderException("Property '%s' is not declared by the mapped graph type", mapping.property_name);
+		}
+		auto &column = ResolveColumn(table, mapping.source_column);
+		auto gql_type = properties->GetValue(1, schema_row).GetValue<string>();
+		auto expected = GqlTypedPropertyDuckType(gql_type);
+		if (!StringUtil::CIEquals(column.Type().ToString(), expected)) {
+			throw BinderException("Referenced property '%s' expects %s but column %s.%s.%s has type %s",
+			                      mapping.property_name, expected, table.schema, table.table, column.Name(),
+			                      column.Type().ToString());
+		}
+		auto nullable = properties->GetValue(2, schema_row).GetValue<bool>();
+		if (validate && !nullable) {
+			auto nulls = GqlQuery(connection, "SELECT count(*)::UBIGINT FROM " + QualifiedTable(table) + " WHERE " +
+			                                      GqlQuoteIdentifier(column.Name()) + " IS NULL");
+			if (nulls->GetValue(0, 0).GetValue<uint64_t>() != 0) {
+				throw InvalidInputException("Referenced property %s.%s.%s violates NOT NULL graph schema", table.schema,
+				                            table.table, column.Name());
+			}
+		}
+		GqlQuery(connection, "INSERT INTO gql_internal.graph_property_mappings "
+		                     "(element_table_id, property_name, column_name, gql_type, nullable, writable) VALUES (" +
+		                         to_string(element_table_id) + ", " + GqlQuoteLiteral(mapping.property_name) + ", " +
+		                         GqlQuoteLiteral(column.Name()) + ", " + GqlQuoteLiteral(expected) + ", " +
+		                         (nullable ? "true" : "false") + ", false)");
+	}
+}
+
+static void AppendFingerprintField(string &fingerprint, const string &value) {
+	fingerprint += to_string(value.size()) + ":" + value + ";";
+}
+
+static string ReadSingleColumn(const Value &value, const char *description);
+
+static uint64_t ReadSourceTableOid(Connection &connection, const TableDescription &table) {
+	auto result =
+	    GqlQuery(connection, "SELECT table_oid::UBIGINT FROM duckdb_tables() WHERE "
+	                         "lower(database_name) = " +
+	                             GqlQuoteLiteral(StringUtil::Lower(table.database)) +
+	                             " AND lower(schema_name) = " + GqlQuoteLiteral(StringUtil::Lower(table.schema)) +
+	                             " AND lower(table_name) = " + GqlQuoteLiteral(StringUtil::Lower(table.table)));
+	if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
+		throw BinderException("Referenced source table %s.%s.%s is not an attached base table", table.database,
+		                      table.schema, table.table);
+	}
+	return result->GetValue(0, 0).GetValue<uint64_t>();
+}
+
+static string ReadDuckLakeTableUuid(Connection &connection, const TableDescription &table) {
+	auto result = GqlQuery(
+	    connection, "SELECT table_uuid::VARCHAR FROM " + GqlQuoteIdentifier(table.database) +
+	                    ".table_info() WHERE lower(table_name) = " + GqlQuoteLiteral(StringUtil::Lower(table.table)));
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		throw BinderException("Referenced DuckLake table %s.%s.%s has no persistent table UUID", table.database,
+		                      table.schema, table.table);
+	}
+	if (result->RowCount() != 1) {
+		throw NotImplementedException("DuckLake table name '%s' is ambiguous across source schemas; referenced "
+		                              "graphs currently require mapped table names to be unique within the catalog",
+		                              table.table);
+	}
+	return result->GetValue(0, 0).GetValue<string>();
+}
+
+static string ReadSourceTableIdentity(Connection &connection, const TableDescription &table,
+                                      const string &source_kind) {
+	if (StringUtil::CIEquals(source_kind, "DUCKLAKE")) {
+		auto database =
+		    GqlQuery(connection, "SELECT lower(type) FROM duckdb_databases() WHERE lower(database_name) = " +
+		                             GqlQuoteLiteral(StringUtil::Lower(table.database)));
+		if (database->RowCount() == 1 && !database->GetValue(0, 0).IsNull() &&
+		    database->GetValue(0, 0).GetValue<string>() == "ducklake") {
+			return "uuid:" + ReadDuckLakeTableUuid(connection, table);
+		}
+	}
+	return "oid:" + to_string(ReadSourceTableOid(connection, table));
+}
+
+static bool ReadSourceColumnNullable(Connection &connection, const TableDescription &table, const string &column_name) {
+	auto result =
+	    GqlQuery(connection, "SELECT is_nullable FROM duckdb_columns() WHERE lower(database_name) = " +
+	                             GqlQuoteLiteral(StringUtil::Lower(table.database)) +
+	                             " AND lower(schema_name) = " + GqlQuoteLiteral(StringUtil::Lower(table.schema)) +
+	                             " AND lower(table_name) = " + GqlQuoteLiteral(StringUtil::Lower(table.table)) +
+	                             " AND lower(column_name) = " + GqlQuoteLiteral(StringUtil::Lower(column_name)));
+	if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
+		throw BinderException("Referenced source column %s.%s.%s.%s no longer exists", table.database, table.schema,
+		                      table.table, column_name);
+	}
+	return result->GetValue(0, 0).GetValue<bool>();
+}
+
+static void AppendSourceColumnFingerprint(Connection &connection, string &fingerprint, const TableDescription &table,
+                                          const string &role, const string &column_name) {
+	auto &column = ResolveColumn(table, column_name);
+	AppendFingerprintField(fingerprint, role);
+	AppendFingerprintField(fingerprint, StringUtil::Lower(column.Name()));
+	AppendFingerprintField(fingerprint, column.Type().ToString());
+	AppendFingerprintField(fingerprint,
+	                       ReadSourceColumnNullable(connection, table, column.Name()) ? "NULL" : "NOT_NULL");
+}
+
+// This is intentionally based only on graph-visible source structure. Adding
+// an unmapped/private source column must not invalidate a referenced graph.
+// Persistent DuckLake table UUIDs (and native DuckDB table OIDs) distinguish a
+// compatible table from a new table recreated under the same qualified name.
+static string BuildReferencedSchemaFingerprint(Connection &connection, uint64_t graph_id, const string &source_kind) {
+	string fingerprint = "v1|";
+	auto tables = GqlQuery(connection, "SELECT element_table_id, element_kind, catalog_name, schema_name, table_name, "
+	                                   "key_columns FROM gql_internal.graph_element_tables WHERE graph_id = " +
+	                                       to_string(graph_id) + " AND ownership = 'REFERENCED' ORDER BY element_kind");
+	if (tables->RowCount() != 2) {
+		throw InvalidInputException("Referenced graph metadata must contain one vertex and one edge table");
+	}
+	for (idx_t row = 0; row < tables->RowCount(); row++) {
+		auto element_table_id = tables->GetValue(0, row).GetValue<uint64_t>();
+		auto kind = tables->GetValue(1, row).GetValue<string>();
+		auto catalog = tables->GetValue(2, row).GetValue<string>();
+		auto schema = tables->GetValue(3, row).GetValue<string>();
+		auto table_name = tables->GetValue(4, row).GetValue<string>();
+		auto table = ResolveTable(connection, GqlQuoteIdentifier(catalog) + "." + GqlQuoteIdentifier(schema) + "." +
+		                                          GqlQuoteIdentifier(table_name));
+		AppendFingerprintField(fingerprint, kind);
+		AppendFingerprintField(fingerprint, StringUtil::Lower(table->database));
+		AppendFingerprintField(fingerprint, StringUtil::Lower(table->schema));
+		AppendFingerprintField(fingerprint, StringUtil::Lower(table->table));
+		AppendFingerprintField(fingerprint, ReadSourceTableIdentity(connection, *table, source_kind));
+		AppendSourceColumnFingerprint(connection, fingerprint, *table, "KEY",
+		                              ReadSingleColumn(tables->GetValue(5, row), "element key"));
+
+		if (kind == "EDGE") {
+			auto endpoints = GqlQuery(connection, "SELECT source_columns, target_columns FROM "
+			                                      "gql_internal.graph_edge_endpoints WHERE edge_table_id = " +
+			                                          to_string(element_table_id));
+			if (endpoints->RowCount() != 1) {
+				throw InvalidInputException("Referenced graph contains invalid edge endpoint metadata");
+			}
+			AppendSourceColumnFingerprint(connection, fingerprint, *table, "SOURCE",
+			                              ReadSingleColumn(endpoints->GetValue(0, 0), "edge source"));
+			AppendSourceColumnFingerprint(connection, fingerprint, *table, "TARGET",
+			                              ReadSingleColumn(endpoints->GetValue(1, 0), "edge destination"));
+		}
+
+		auto labels =
+		    GqlQuery(connection, "SELECT mapping_kind, coalesce(label_name, ''), coalesce(column_name, '') "
+		                         "FROM gql_internal.graph_label_mappings WHERE element_table_id = " +
+		                             to_string(element_table_id) + " ORDER BY mapping_kind, label_name, column_name");
+		for (idx_t label = 0; label < labels->RowCount(); label++) {
+			auto mapping_kind = labels->GetValue(0, label).GetValue<string>();
+			AppendFingerprintField(fingerprint, "LABEL");
+			AppendFingerprintField(fingerprint, mapping_kind);
+			AppendFingerprintField(fingerprint, labels->GetValue(1, label).GetValue<string>());
+			auto column_name = labels->GetValue(2, label).GetValue<string>();
+			if (!column_name.empty()) {
+				AppendSourceColumnFingerprint(connection, fingerprint, *table, "LABEL_COLUMN", column_name);
+			}
+		}
+
+		auto types = GqlQuery(connection, "SELECT se.element_kind, se.type_name, tm.discriminator_kind, "
+		                                  "coalesce(tm.discriminator_value, '') FROM "
+		                                  "gql_internal.graph_element_type_mappings tm JOIN "
+		                                  "gql_internal.graph_schema_elements se USING (schema_element_id) WHERE "
+		                                  "tm.element_table_id = " +
+		                                      to_string(element_table_id) + " ORDER BY se.element_kind, se.type_name");
+		for (idx_t type = 0; type < types->RowCount(); type++) {
+			AppendFingerprintField(fingerprint, "TYPE");
+			for (idx_t column = 0; column < 4; column++) {
+				AppendFingerprintField(fingerprint, types->GetValue(column, type).GetValue<string>());
+			}
+		}
+
+		auto properties = GqlQuery(connection, "SELECT property_name, column_name, gql_type, nullable FROM "
+		                                       "gql_internal.graph_property_mappings WHERE element_table_id = " +
+		                                           to_string(element_table_id) + " ORDER BY property_name");
+		for (idx_t property = 0; property < properties->RowCount(); property++) {
+			AppendFingerprintField(fingerprint, "PROPERTY");
+			AppendFingerprintField(fingerprint, properties->GetValue(0, property).GetValue<string>());
+			AppendFingerprintField(fingerprint, properties->GetValue(2, property).GetValue<string>());
+			AppendFingerprintField(fingerprint,
+			                       properties->GetValue(3, property).GetValue<bool>() ? "NULL" : "NOT_NULL");
+			AppendSourceColumnFingerprint(connection, fingerprint, *table, "PROPERTY_COLUMN",
+			                              properties->GetValue(1, property).GetValue<string>());
+		}
+	}
+	return fingerprint;
+}
+
+void GqlAttachReferencedGraphTables(Connection &connection, const string &graph_name,
+                                    const GqlReferencedTableMapping &mapping) {
+	GqlEnsureStorage(connection);
+	auto vertex = ResolveTable(connection, mapping.vertex_table);
+	auto edge = ResolveTable(connection, mapping.edge_table);
+	if (!StringUtil::CIEquals(vertex->database, edge->database)) {
+		throw BinderException("Referenced vertex and edge tables must use the same catalog");
+	}
+	auto &vertex_key = ResolveColumn(*vertex, mapping.vertex_key);
+	auto &edge_key = ResolveColumn(*edge, mapping.edge_key);
+	auto &edge_source = ResolveColumn(*edge, mapping.edge_source);
+	auto &edge_target = ResolveColumn(*edge, mapping.edge_target);
+	if (!IsReferencedKeyType(vertex_key.Type()) || !IsReferencedKeyType(edge_key.Type())) {
+		throw BinderException("Referenced graph keys must use integer types");
+	}
+	if (edge_source.Type() != vertex_key.Type() || edge_target.Type() != vertex_key.Type()) {
+		throw BinderException("Referenced edge endpoint types must exactly match vertex key type %s",
+		                      vertex_key.Type().ToString());
+	}
+	if (!StringUtil::CIEquals(mapping.source_schema_type, mapping.vertex_schema_type) ||
+	    !StringUtil::CIEquals(mapping.target_schema_type, mapping.vertex_schema_type)) {
+		throw BinderException("The first referenced-graph slice requires both edge endpoints to map to node type '%s'",
+		                      mapping.vertex_schema_type);
+	}
+	if (mapping.validate) {
+		ValidateKey(connection, *vertex, vertex_key);
+		ValidateKey(connection, *edge, edge_key);
+		ValidateEndpoint(connection, *edge, edge_source, *vertex, vertex_key, "source");
+		ValidateEndpoint(connection, *edge, edge_target, *vertex, vertex_key, "destination");
+	}
+
+	auto graph = GqlQuery(connection, "SELECT g.graph_id, gs.storage_mode FROM gql_internal.graphs g JOIN "
+	                                  "gql_internal.graph_storage gs USING (graph_id) WHERE g.graph_name = " +
+	                                      GqlQuoteLiteral(graph_name));
+	if (graph->RowCount() != 1 || graph->GetValue(1, 0).GetValue<string>() != "EMPTY") {
+		throw InvalidInputException("Graph '%s' must be empty before attaching referenced tables", graph_name);
+	}
+	auto graph_id = graph->GetValue(0, 0).GetValue<uint64_t>();
+	auto vertex_schema_id = FindSchemaElement(connection, graph_id, "NODE", mapping.vertex_schema_type);
+	auto edge_schema_id = FindSchemaElement(connection, graph_id, "EDGE", mapping.edge_schema_type);
+
+	auto vertex_id = InsertElementTable(connection, graph_id, "VERTEX", *vertex, vertex_key.Name(), "REFERENCED");
+	auto edge_id = InsertElementTable(connection, graph_id, "EDGE", *edge, edge_key.Name(), "REFERENCED");
+	GqlQuery(connection, "UPDATE gql_internal.graph_element_tables SET access_mode = 'READ_ONLY' WHERE "
+	                     "element_table_id IN (" +
+	                         to_string(vertex_id) + ", " + to_string(edge_id) + ")");
+	InsertStaticLabels(connection, vertex_id, vertex_schema_id, mapping.vertex_schema_type);
+	InsertStaticLabels(connection, edge_id, edge_schema_id, mapping.edge_schema_type);
+	InsertReferencedProperties(connection, vertex_id, vertex_schema_id, *vertex, mapping.vertex_properties,
+	                           mapping.validate);
+	InsertReferencedProperties(connection, edge_id, edge_schema_id, *edge, mapping.edge_properties, mapping.validate);
+	GqlQuery(connection, "INSERT INTO gql_internal.graph_element_type_mappings "
+	                     "(element_table_id, schema_element_id, discriminator_kind) VALUES (" +
+	                         to_string(vertex_id) + ", " + to_string(vertex_schema_id) + ", 'STATIC'), (" +
+	                         to_string(edge_id) + ", " + to_string(edge_schema_id) + ", 'STATIC')");
+	GqlQuery(connection, "INSERT INTO gql_internal.graph_edge_endpoints "
+	                     "(edge_table_id, source_vertex_table_id, target_vertex_table_id, source_columns, "
+	                     "target_columns, source_key_columns, target_key_columns) VALUES (" +
+	                         to_string(edge_id) + ", " + to_string(vertex_id) + ", " + to_string(vertex_id) + ", [" +
+	                         GqlQuoteLiteral(edge_source.Name()) + "], [" + GqlQuoteLiteral(edge_target.Name()) +
+	                         "], [" + GqlQuoteLiteral(vertex_key.Name()) + "], [" + GqlQuoteLiteral(vertex_key.Name()) +
+	                         "])");
+
+	auto database = GqlQuery(connection, "SELECT lower(type) FROM duckdb_databases() WHERE database_name = " +
+	                                         GqlQuoteLiteral(vertex->database));
+	if (database->RowCount() != 1) {
+		throw BinderException("Referenced source catalog '%s' is not attached", vertex->database);
+	}
+	auto database_type = database->GetValue(0, 0).GetValue<string>();
+	string source_kind;
+	if (database_type == "ducklake") {
+		source_kind = "DUCKLAKE";
+	} else if (database_type == "duckdb") {
+		source_kind = "DUCKDB";
+	} else {
+		throw NotImplementedException("Referenced graphs do not yet support catalog type '%s'", database_type);
+	}
+	string snapshot = "NULL";
+	if (source_kind == "DUCKLAKE") {
+		auto current = GqlQuery(connection, "SELECT id::UBIGINT FROM " + GqlQuoteIdentifier(vertex->database) +
+		                                        ".current_snapshot()");
+		if (current->RowCount() != 1) {
+			throw BinderException("DuckLake catalog '%s' did not expose a current snapshot", vertex->database);
+		}
+		snapshot = to_string(current->GetValue(0, 0).GetValue<uint64_t>());
+	}
+	auto fingerprint = BuildReferencedSchemaFingerprint(connection, graph_id, source_kind);
+	GqlQuery(connection, "INSERT INTO gql_internal.graph_sources "
+	                     "(graph_id, source_kind, source_catalog, snapshot_policy, access_mode, "
+	                     "registered_snapshot_id, last_validated_snapshot_id, schema_fingerprint) VALUES (" +
+	                         to_string(graph_id) + ", " + GqlQuoteLiteral(source_kind) + ", " +
+	                         GqlQuoteLiteral(vertex->database) + ", " + GqlQuoteLiteral(mapping.snapshot_policy) +
+	                         ", " + GqlQuoteLiteral(mapping.access_mode) + ", " + snapshot + ", " +
+	                         (mapping.validate ? snapshot : "NULL") + ", " + GqlQuoteLiteral(fingerprint) + ")");
+	GqlQuery(connection, "UPDATE gql_internal.graph_storage SET storage_mode = 'TABLE_BACKED', default_catalog = " +
+	                         GqlQuoteLiteral(vertex->database) +
+	                         ", default_schema = " + GqlQuoteLiteral(vertex->schema) +
+	                         ", schema_version = schema_version + 1, "
+	                         "csr_policy = 'MANUAL' WHERE graph_id = " +
+	                         to_string(graph_id));
+	GqlQuery(connection, "UPDATE gql_internal.graphs SET graph_version = graph_version + 1 WHERE graph_id = " +
+	                         to_string(graph_id));
+}
+
 static string ReadSingleColumn(const Value &value, const char *description) {
 	const auto &children = ListValue::GetChildren(value);
 	if (children.size() != 1 || children[0].IsNull()) {
@@ -246,22 +608,30 @@ static void LoadPropertyIndexes(Connection &connection, GqlElementTableBinding &
 }
 
 static void LoadLabel(Connection &connection, GqlElementTableBinding &table) {
-	auto result = GqlQuery(connection, "SELECT mapping_kind, column_name FROM "
+	auto result = GqlQuery(connection, "SELECT mapping_kind, column_name, label_name FROM "
 	                                   "gql_internal.graph_label_mappings WHERE "
 	                                   "element_table_id = " +
 	                                       to_string(table.element_table_id));
 	if (result->RowCount() == 0) {
 		return;
 	}
-	if (result->RowCount() != 1) {
-		throw NotImplementedException("Table-backed MATCH currently requires one label/type column");
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		auto mapping_kind = result->GetValue(0, row).GetValue<string>();
+		if (mapping_kind == "STATIC") {
+			if (!table.label_column.empty() || result->GetValue(2, row).IsNull()) {
+				throw InvalidInputException("Table-backed graph contains inconsistent static label metadata");
+			}
+			table.static_labels.push_back(result->GetValue(2, row).GetValue<string>());
+			continue;
+		}
+		if ((mapping_kind != "SCALAR_COLUMN" && mapping_kind != "LIST_COLUMN") || result->RowCount() != 1 ||
+		    !table.static_labels.empty()) {
+			throw NotImplementedException("Table-backed MATCH does not support mixed label mapping kind '%s'",
+			                              mapping_kind);
+		}
+		table.label_is_list = mapping_kind == "LIST_COLUMN";
+		table.label_column = result->GetValue(1, row).GetValue<string>();
 	}
-	auto mapping_kind = result->GetValue(0, 0).GetValue<string>();
-	if (mapping_kind != "SCALAR_COLUMN" && mapping_kind != "LIST_COLUMN") {
-		throw NotImplementedException("Table-backed MATCH does not support label mapping kind '%s'", mapping_kind);
-	}
-	table.label_is_list = mapping_kind == "LIST_COLUMN";
-	table.label_column = result->GetValue(1, 0).GetValue<string>();
 }
 
 bool GqlTryLoadTableGraph(ClientContext &context, const string &graph_name, GqlTableGraphBinding &result) {
@@ -313,6 +683,33 @@ bool GqlTryLoadTableGraph(ClientContext &context, const string &graph_name, GqlT
 	}
 	result.edge_source_column = ReadSingleColumn(endpoints->GetValue(2, 0), "edge source");
 	result.edge_target_column = ReadSingleColumn(endpoints->GetValue(3, 0), "edge destination");
+	auto source = GqlQuery(connection, "SELECT source_kind, source_catalog, snapshot_policy, access_mode, "
+	                                   "schema_fingerprint FROM "
+	                                   "gql_internal.graph_sources WHERE graph_id = " +
+	                                       to_string(result.graph_id));
+	if (source->RowCount() == 1) {
+		result.source_kind = source->GetValue(0, 0).GetValue<string>();
+		result.source_catalog = source->GetValue(1, 0).GetValue<string>();
+		result.snapshot_policy = source->GetValue(2, 0).GetValue<string>();
+		result.access_mode = source->GetValue(3, 0).GetValue<string>();
+		auto registered_fingerprint = source->GetValue(4, 0).GetValue<string>();
+		try {
+			auto current_fingerprint =
+			    BuildReferencedSchemaFingerprint(connection, result.graph_id, result.source_kind);
+			if (registered_fingerprint != current_fingerprint) {
+				throw InvalidInputException("Referenced graph '%s' source schema or table identity changed; recreate "
+				                            "the graph mapping",
+				                            graph_name);
+			}
+		} catch (const InvalidInputException &) {
+			throw;
+		} catch (const std::exception &error) {
+			throw InvalidInputException("Referenced graph '%s' source schema validation failed: %s", graph_name,
+			                            error.what());
+		}
+	} else if (source->RowCount() != 0) {
+		throw InvalidInputException("Table-backed graph '%s' contains duplicate source metadata", graph_name);
+	}
 	return true;
 }
 

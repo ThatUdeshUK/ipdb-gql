@@ -921,6 +921,300 @@ static string RewriteChainedLabelSyntax(const string &query) {
 	return result;
 }
 
+static idx_t FindReferencedGraphClause(const string &query) {
+	idx_t brace_depth = 0;
+	idx_t parenthesis_depth = 0;
+	char quote = '\0';
+	for (idx_t index = 0; index < query.size(); index++) {
+		auto character = query[index];
+		if (quote) {
+			if (character == quote) {
+				if (index + 1 < query.size() && query[index + 1] == quote) {
+					index++;
+				} else {
+					quote = '\0';
+				}
+			}
+			continue;
+		}
+		if (character == '-' && index + 1 < query.size() && query[index + 1] == '-') {
+			auto newline = query.find('\n', index + 2);
+			if (newline == string::npos) {
+				return DConstants::INVALID_INDEX;
+			}
+			index = newline;
+			continue;
+		}
+		if (character == '/' && index + 1 < query.size() && query[index + 1] == '*') {
+			auto end = query.find("*/", index + 2);
+			if (end == string::npos) {
+				return DConstants::INVALID_INDEX;
+			}
+			index = end + 1;
+			continue;
+		}
+		if (character == '\'' || character == '"' || character == '`') {
+			quote = character;
+			continue;
+		}
+		if (character == '{') {
+			brace_depth++;
+			continue;
+		}
+		if (character == '}') {
+			if (brace_depth > 0) {
+				brace_depth--;
+			}
+			continue;
+		}
+		if (character == '(') {
+			parenthesis_depth++;
+			continue;
+		}
+		if (character == ')') {
+			if (parenthesis_depth > 0) {
+				parenthesis_depth--;
+			}
+			continue;
+		}
+		if (brace_depth != 0 || parenthesis_depth != 0 ||
+		    !(std::isalpha(static_cast<unsigned char>(character)) || character == '_')) {
+			continue;
+		}
+		auto word_start = index;
+		while (index + 1 < query.size() &&
+		       (std::isalnum(static_cast<unsigned char>(query[index + 1])) || query[index + 1] == '_')) {
+			index++;
+		}
+		if (!StringUtil::CIEquals(query.substr(word_start, index - word_start + 1), "FROM")) {
+			continue;
+		}
+		auto cursor = SkipGqlTrivia(query, index + 1);
+		if (cursor + 6 <= query.size() && StringUtil::CIEquals(query.substr(cursor, 6), "TABLES") &&
+		    (cursor + 6 == query.size() ||
+		     !(std::isalnum(static_cast<unsigned char>(query[cursor + 6])) || query[cursor + 6] == '_'))) {
+			return word_start;
+		}
+	}
+	return DConstants::INVALID_INDEX;
+}
+
+class ReferencedGraphParser {
+public:
+	ReferencedGraphParser(const string &query_p, idx_t offset_p) : query(query_p), offset(offset_p) {
+	}
+
+	GqlReferencedGraphDefinition Parse() {
+		GqlReferencedGraphDefinition result;
+		result.present = true;
+		ExpectKeyword("FROM");
+		ExpectKeyword("TABLES");
+		ExpectCharacter('(');
+		result.vertex = ParseElement(GqlPatternElementType::VERTEX);
+		ExpectCharacter(',');
+		result.edge = ParseElement(GqlPatternElementType::EDGE);
+		ExpectCharacter(')');
+		if (ConsumeKeyword("OPTIONS")) {
+			ExpectCharacter('(');
+			bool first = true;
+			while (!ConsumeCharacter(')')) {
+				if (!first) {
+					ExpectCharacter(',');
+				}
+				first = false;
+				if (ConsumeKeyword("SNAPSHOT_POLICY")) {
+					result.snapshot_policy = StringUtil::Upper(ParseString());
+					if (result.snapshot_policy != "LIVE") {
+						Error("only SNAPSHOT_POLICY 'LIVE' is supported");
+					}
+				} else if (ConsumeKeyword("ACCESS_MODE")) {
+					result.access_mode = StringUtil::Upper(ParseString());
+					if (result.access_mode != "READ_ONLY") {
+						Error("only ACCESS_MODE 'READ_ONLY' is supported");
+					}
+				} else if (ConsumeKeyword("VALIDATE")) {
+					result.validate = ParseBoolean();
+				} else {
+					Error("expected SNAPSHOT_POLICY, ACCESS_MODE, or VALIDATE option");
+				}
+			}
+		}
+		if (!AtEnd()) {
+			Error("unexpected trailing input");
+		}
+		return result;
+	}
+
+private:
+	GqlGraphElementTableMapping ParseElement(GqlPatternElementType expected_kind) {
+		GqlGraphElementTableMapping result;
+		result.kind = expected_kind;
+		ExpectKeyword(expected_kind == GqlPatternElementType::VERTEX ? "VERTEX" : "EDGE");
+		ExpectKeyword("TABLE");
+		result.qualified_table = ParseQualifiedName();
+		ExpectKeyword("MAP");
+		ExpectKeyword("TO");
+		ExpectKeyword(expected_kind == GqlPatternElementType::VERTEX ? "NODE" : "EDGE");
+		ExpectKeyword("TYPE");
+		result.schema_type = ParseIdentifier();
+		ExpectKeyword("KEY");
+		ExpectCharacter('(');
+		result.key_column = ParseIdentifier();
+		ExpectCharacter(')');
+		if (expected_kind == GqlPatternElementType::EDGE) {
+			ExpectKeyword("SOURCE");
+			ExpectCharacter('(');
+			result.source_column = ParseIdentifier();
+			ExpectCharacter(')');
+			ExpectKeyword("REFERENCES");
+			ExpectKeyword("NODE");
+			ExpectKeyword("TYPE");
+			result.source_schema_type = ParseIdentifier();
+			ExpectKeyword("DESTINATION");
+			ExpectCharacter('(');
+			result.target_column = ParseIdentifier();
+			ExpectCharacter(')');
+			ExpectKeyword("REFERENCES");
+			ExpectKeyword("NODE");
+			ExpectKeyword("TYPE");
+			result.target_schema_type = ParseIdentifier();
+		}
+		if (ConsumeKeyword("PROPERTIES")) {
+			ExpectCharacter('(');
+			if (!ConsumeCharacter(')')) {
+				while (true) {
+					GqlGraphPropertyColumnMapping property;
+					property.source_column = ParseIdentifier();
+					ExpectKeyword("AS");
+					property.property_name = ParseIdentifier();
+					result.properties.push_back(std::move(property));
+					if (ConsumeCharacter(')')) {
+						break;
+					}
+					ExpectCharacter(',');
+				}
+			}
+		}
+		return result;
+	}
+
+	void SkipWhitespace() {
+		offset = SkipGqlTrivia(query, offset);
+	}
+
+	bool AtEnd() {
+		SkipWhitespace();
+		return offset == query.size();
+	}
+
+	[[noreturn]] void Error(const string &message) const {
+		throw ParserException("CREATE GRAPH FROM TABLES parser error at byte %llu: %s",
+		                      static_cast<unsigned long long>(offset), message);
+	}
+
+	bool ConsumeKeyword(const string &keyword) {
+		SkipWhitespace();
+		if (offset + keyword.size() > query.size() ||
+		    !StringUtil::CIEquals(query.substr(offset, keyword.size()), keyword)) {
+			return false;
+		}
+		auto end = offset + keyword.size();
+		if (end < query.size() && (std::isalnum(static_cast<unsigned char>(query[end])) || query[end] == '_')) {
+			return false;
+		}
+		offset = end;
+		return true;
+	}
+
+	void ExpectKeyword(const string &keyword) {
+		if (!ConsumeKeyword(keyword)) {
+			Error("expected " + keyword);
+		}
+	}
+
+	bool ConsumeCharacter(char character) {
+		SkipWhitespace();
+		if (offset >= query.size() || query[offset] != character) {
+			return false;
+		}
+		offset++;
+		return true;
+	}
+
+	void ExpectCharacter(char character) {
+		if (!ConsumeCharacter(character)) {
+			Error("expected '" + string(1, character) + "'");
+		}
+	}
+
+	GqlIdentifier ParseIdentifier() {
+		SkipWhitespace();
+		auto start = offset;
+		if (offset >= query.size() ||
+		    !(std::isalpha(static_cast<unsigned char>(query[offset])) || query[offset] == '_')) {
+			Error("expected a regular identifier");
+		}
+		offset++;
+		while (offset < query.size() &&
+		       (std::isalnum(static_cast<unsigned char>(query[offset])) || query[offset] == '_')) {
+			offset++;
+		}
+		GqlIdentifier result;
+		result.value = StringUtil::Lower(query.substr(start, offset - start));
+		result.source.start_offset = start;
+		result.source.end_offset = offset;
+		return result;
+	}
+
+	string ParseQualifiedName() {
+		string result;
+		for (idx_t part = 0; part < 3; part++) {
+			if (part > 0) {
+				ExpectCharacter('.');
+				result += ".";
+			}
+			result += ParseIdentifier().value;
+		}
+		return result;
+	}
+
+	string ParseString() {
+		SkipWhitespace();
+		if (offset >= query.size() || query[offset] != '\'') {
+			Error("expected a single-quoted string");
+		}
+		offset++;
+		string result;
+		while (offset < query.size()) {
+			auto character = query[offset++];
+			if (character != '\'') {
+				result += character;
+				continue;
+			}
+			if (offset < query.size() && query[offset] == '\'') {
+				result += '\'';
+				offset++;
+				continue;
+			}
+			return result;
+		}
+		Error("unterminated string");
+	}
+
+	bool ParseBoolean() {
+		if (ConsumeKeyword("TRUE")) {
+			return true;
+		}
+		if (ConsumeKeyword("FALSE")) {
+			return false;
+		}
+		Error("expected TRUE or FALSE");
+	}
+
+	const string &query;
+	idx_t offset;
+};
+
 class CopyGraphParser {
 public:
 	explicit CopyGraphParser(const string &query_p) : query(query_p) {
@@ -1353,6 +1647,42 @@ ParserExtensionParseResult GqlParse(ParserExtensionInfo *, const string &query) 
 	}
 
 	auto gql_query = StripTerminator(query);
+	auto referenced_offset = StartsWithGqlKeywords(gql_query, {"CREATE", "GRAPH"})
+	                             ? FindReferencedGraphClause(gql_query)
+	                             : DConstants::INVALID_INDEX;
+	if (referenced_offset != DConstants::INVALID_INDEX) {
+		auto schema_query = gql_query.substr(0, referenced_offset);
+		StringUtil::RTrim(schema_query);
+		antlr4::ANTLRInputStream input(schema_query);
+		GQLLexer lexer(&input);
+		antlr4::CommonTokenStream tokens(&lexer);
+		GQLParser parser(&tokens);
+		GqlErrorListener errors(schema_query);
+		lexer.removeErrorListeners();
+		parser.removeErrorListeners();
+		lexer.addErrorListener(&errors);
+		parser.addErrorListener(&errors);
+		auto tree = parser.gqlProgram();
+		if (!errors.error.empty()) {
+			ParserExtensionParseResult result(errors.error);
+			result.error_location = errors.location;
+			return result;
+		}
+		GqlTransformer transformer(schema_query);
+		auto statement = transformer.Transform(*tree);
+		if (!statement || statement->type != GqlStatementType::CREATE_GRAPH) {
+			throw ParserException("FROM TABLES requires CREATE GRAPH");
+		}
+		auto create = dynamic_cast<GqlCreateGraphStatement *>(statement.get());
+		if (!create || !create->schema.typed) {
+			throw ParserException("CREATE GRAPH FROM TABLES requires an inline TYPED graph schema");
+		}
+		create->referenced = ReferencedGraphParser(gql_query, referenced_offset).Parse();
+		auto parse_data = make_uniq<GqlParseData>();
+		parse_data->query = gql_query;
+		parse_data->statement = std::move(statement);
+		return ParserExtensionParseResult(std::move(parse_data));
+	}
 	if (StartsWithGqlKeywords(gql_query, {"COPY", "GRAPH"})) {
 		auto parse_data = make_uniq<GqlParseData>();
 		parse_data->query = gql_query;
@@ -1679,6 +2009,36 @@ ParserExtensionPlanResult GqlPlan(ParserExtensionInfo *, ClientContext &,
 		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(property_names)));
 		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(property_types)));
 		result.parameters.emplace_back(Value::LIST(LogicalType::BOOLEAN, std::move(property_nullables)));
+		result.parameters.emplace_back(create.referenced.present);
+		result.parameters.emplace_back(create.referenced.vertex.qualified_table);
+		result.parameters.emplace_back(create.referenced.vertex.schema_type.value);
+		result.parameters.emplace_back(create.referenced.vertex.key_column.value);
+		vector<Value> vertex_property_columns;
+		vector<Value> vertex_property_names;
+		for (const auto &property : create.referenced.vertex.properties) {
+			vertex_property_columns.emplace_back(property.source_column.value);
+			vertex_property_names.emplace_back(property.property_name.value);
+		}
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(vertex_property_columns)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(vertex_property_names)));
+		result.parameters.emplace_back(create.referenced.edge.qualified_table);
+		result.parameters.emplace_back(create.referenced.edge.schema_type.value);
+		result.parameters.emplace_back(create.referenced.edge.key_column.value);
+		result.parameters.emplace_back(create.referenced.edge.source_column.value);
+		result.parameters.emplace_back(create.referenced.edge.target_column.value);
+		result.parameters.emplace_back(create.referenced.edge.source_schema_type.value);
+		result.parameters.emplace_back(create.referenced.edge.target_schema_type.value);
+		vector<Value> edge_property_columns;
+		vector<Value> edge_property_names;
+		for (const auto &property : create.referenced.edge.properties) {
+			edge_property_columns.emplace_back(property.source_column.value);
+			edge_property_names.emplace_back(property.property_name.value);
+		}
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(edge_property_columns)));
+		result.parameters.emplace_back(Value::LIST(LogicalType::VARCHAR, std::move(edge_property_names)));
+		result.parameters.emplace_back(create.referenced.snapshot_policy);
+		result.parameters.emplace_back(create.referenced.access_mode);
+		result.parameters.emplace_back(create.referenced.validate);
 		return result;
 	}
 	case GqlStatementType::COPY_GRAPH: {

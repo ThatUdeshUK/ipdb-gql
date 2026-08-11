@@ -1,0 +1,257 @@
+# name: test/sql/gql_referenced_graph.test
+# description: Map selected external table columns into a read-only typed graph
+# group: [gql]
+
+load __TEST_DIR__/gql_referenced_graph.db
+
+require duckgql
+
+statement ok
+ATTACH ':memory:' AS lake
+
+statement ok
+CREATE TABLE lake.main.person (
+    person_id BIGINT NOT NULL,
+    full_name VARCHAR,
+    age_years BIGINT,
+    private_note VARCHAR
+)
+
+statement ok
+CREATE TABLE lake.main.person_knows (
+    relationship_id BIGINT NOT NULL,
+    src_person_id BIGINT NOT NULL,
+    dst_person_id BIGINT NOT NULL,
+    since_year INTEGER
+)
+
+statement ok
+INSERT INTO lake.main.person VALUES
+    (1, 'Ada', 42, 'hidden'),
+    (2, 'Grace', 37, 'hidden')
+
+statement ok
+INSERT INTO lake.main.person_knows VALUES (10, 1, 2, 2020)
+
+query IT
+CREATE GRAPH social TYPED {
+    (Person :Person {id INT64 NOT NULL, name STRING, age INT64}),
+    (Person)-[:KNOWS {id INT64 NOT NULL, since INT32}]->(Person)
+}
+FROM TABLES (
+    VERTEX TABLE lake.main.person
+        MAP TO NODE TYPE Person
+        KEY (person_id)
+        PROPERTIES (person_id AS id, full_name AS name, age_years AS age),
+    EDGE TABLE lake.main.person_knows
+        MAP TO EDGE TYPE KNOWS
+        KEY (relationship_id)
+        SOURCE (src_person_id) REFERENCES NODE TYPE Person
+        DESTINATION (dst_person_id) REFERENCES NODE TYPE Person
+        PROPERTIES (relationship_id AS id, since_year AS since)
+)
+OPTIONS (SNAPSHOT_POLICY 'LIVE', ACCESS_MODE 'READ_ONLY', VALIDATE TRUE)
+----
+true	social
+
+query TTT
+SELECT et.element_kind, et.ownership, et.access_mode
+FROM gql_internal.graph_element_tables et
+JOIN gql_internal.graphs g USING (graph_id)
+WHERE g.graph_name = 'social'
+ORDER BY et.element_kind
+----
+EDGE	REFERENCED	READ_ONLY
+VERTEX	REFERENCED	READ_ONLY
+
+query TTT
+SELECT source_kind, snapshot_policy, access_mode
+FROM gql_internal.graph_sources s
+JOIN gql_internal.graphs g USING (graph_id)
+WHERE g.graph_name = 'social'
+----
+DUCKDB	LIVE	READ_ONLY
+
+query II
+SELECT starts_with(schema_fingerprint, 'v1|'), length(schema_fingerprint) > 100
+FROM gql_internal.graph_sources s
+JOIN gql_internal.graphs g USING (graph_id)
+WHERE g.graph_name = 'social'
+----
+true	true
+
+query T
+SELECT csr_policy
+FROM gql_internal.graph_storage s
+JOIN gql_internal.graphs g USING (graph_id)
+WHERE g.graph_name = 'social'
+----
+MANUAL
+
+statement ok
+SESSION SET GRAPH social
+
+statement ok
+CALL gql_build_csr('social')
+
+query III
+SELECT has_vertex_labels, has_edge_labels, source_snapshot_id IS NULL
+FROM gql_csr_stats('social')
+----
+true	true	true
+
+query TI
+SELECT edge_label, edge_count
+FROM gql_csr_edge_stats('social')
+----
+knows	1
+
+query TTI
+MATCH (a:Person)-[e:KNOWS]->(b:Person)
+RETURN a.name, b.name, e.since
+----
+Ada	Grace	2020
+
+query II
+MATCH (p:Person)
+RETURN p.id, p.age
+ORDER BY p.id
+----
+1	42
+2	37
+
+statement error
+MATCH (p:Person) RETURN p.private_note
+----
+<REGEX>:.*Property 'private_note' is not mapped.*
+
+statement error
+MATCH (a:Person)-[:KNOWS]->*(b:Person) RETURN b.private_note
+----
+<REGEX>:.*Property 'private_note' is not mapped.*
+
+statement error
+INSERT (:Person {id: 3, name: 'Katherine', age: 30})
+----
+<REGEX>:.*read-only referenced graph.*
+
+statement error
+CALL gql_create_property_index('social', 'name')
+----
+<REGEX>:.*referenced graph; property indexes are not supported.*
+
+# Model DuckLake's catalog.current_snapshot() contract without requiring the
+# DuckLake extension in the backend-neutral SQL test. A changed source snapshot
+# must evict the prepared CSR and an algorithm must rebuild against the new ID.
+statement ok
+CREATE TABLE lake.main.snapshot_control (id UBIGINT)
+
+statement ok
+INSERT INTO lake.main.snapshot_control VALUES (1)
+
+statement ok
+CREATE MACRO lake.current_snapshot() AS TABLE
+SELECT id FROM lake.main.snapshot_control
+
+statement ok
+UPDATE gql_internal.graph_sources
+SET source_kind = 'DUCKLAKE', source_catalog = 'lake',
+    registered_snapshot_id = 1, last_validated_snapshot_id = 1
+WHERE graph_id = (SELECT graph_id FROM gql_internal.graphs WHERE graph_name = 'social')
+
+statement ok
+CALL gql_build_csr('social')
+
+query TI
+SELECT source_catalog, source_snapshot_id
+FROM gql_csr_stats('social')
+----
+lake	1
+
+statement ok
+UPDATE lake.main.snapshot_control SET id = 2
+
+statement error
+SELECT * FROM gql_csr_stats('social')
+----
+<REGEX>:.*CSR for table-backed graph 'social' has not been built.*
+
+query I
+SELECT count(*) FROM system.algo.pagerank('social')
+----
+2
+
+query TI
+SELECT source_catalog, source_snapshot_id
+FROM gql_csr_stats('social')
+----
+lake	2
+
+# Unmapped source columns are private and may evolve without invalidating the
+# graph-visible schema fingerprint.
+statement ok
+ALTER TABLE lake.main.person ADD COLUMN internal_score DOUBLE
+
+query II
+MATCH (p:Person)
+RETURN p.id, p.age
+ORDER BY p.id
+----
+1	42
+2	37
+
+# A new table under the same qualified name must not silently inherit the old
+# graph mapping, even when its visible columns have the same names and types.
+statement ok
+ALTER TABLE lake.main.person RENAME TO person_original
+
+statement ok
+CREATE TABLE lake.main.person (
+    person_id BIGINT NOT NULL,
+    full_name VARCHAR,
+    age_years BIGINT,
+    private_note VARCHAR,
+    internal_score DOUBLE
+)
+
+statement ok
+INSERT INTO lake.main.person SELECT * FROM lake.main.person_original
+
+statement error
+MATCH (p:Person) RETURN p.id
+----
+<REGEX>:.*source schema or table identity changed.*
+
+statement ok
+DROP GRAPH social
+
+query II
+SELECT (SELECT count(*) FROM lake.main.person),
+       (SELECT count(*) FROM lake.main.person_knows)
+----
+2	1
+
+statement error
+CREATE GRAPH invalid_mapping TYPED {
+    (Person :Person {id INT64 NOT NULL, age INT32}),
+    (Person)-[:KNOWS {id INT64 NOT NULL}]->(Person)
+}
+FROM TABLES (
+    VERTEX TABLE lake.main.person
+        MAP TO NODE TYPE Person
+        KEY (person_id)
+        PROPERTIES (person_id AS id, age_years AS age),
+    EDGE TABLE lake.main.person_knows
+        MAP TO EDGE TYPE KNOWS
+        KEY (relationship_id)
+        SOURCE (src_person_id) REFERENCES NODE TYPE Person
+        DESTINATION (dst_person_id) REFERENCES NODE TYPE Person
+        PROPERTIES (relationship_id AS id)
+)
+----
+<REGEX>:.*Referenced property 'age' expects INTEGER.*has type BIGINT.*
+
+query I
+SELECT count(*) FROM gql_internal.graphs WHERE graph_name = 'invalid_mapping'
+----
+0

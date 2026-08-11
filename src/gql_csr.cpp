@@ -148,16 +148,49 @@ static shared_ptr<GqlDerivedGraphStorageState> GetDerivedGraphStorageState(Clien
 struct GraphVersion {
 	uint64_t graph_id;
 	uint64_t graph_version;
+	bool has_source_snapshot = false;
+	uint64_t source_snapshot_id = 0;
+	string source_catalog;
 };
 
+static uint64_t ReadDuckLakeSnapshot(Connection &connection, const string &catalog) {
+	auto result =
+	    GqlQuery(connection, "SELECT id::UBIGINT FROM " + GqlQuoteIdentifier(catalog) + ".current_snapshot()");
+	if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
+		throw InvalidInputException("DuckLake catalog '%s' did not expose a current snapshot", catalog);
+	}
+	return result->GetValue(0, 0).GetValue<uint64_t>();
+}
+
 static GraphVersion ReadGraphVersion(Connection &connection, const string &graph_name) {
-	auto result = GqlQuery(connection, "SELECT graph_id, graph_version FROM "
-	                                   "gql_internal.graphs WHERE graph_name = " +
+	auto result = GqlQuery(connection, "SELECT g.graph_id, g.graph_version, s.source_kind, s.source_catalog, "
+	                                   "s.snapshot_policy FROM gql_internal.graphs g LEFT JOIN "
+	                                   "gql_internal.graph_sources s USING (graph_id) WHERE g.graph_name = " +
 	                                       GqlQuoteLiteral(graph_name));
 	if (result->RowCount() == 0) {
 		throw InvalidInputException("Graph '%s' does not exist", graph_name);
 	}
-	return {result->GetValue(0, 0).GetValue<uint64_t>(), result->GetValue(1, 0).GetValue<uint64_t>()};
+	GraphVersion version;
+	version.graph_id = result->GetValue(0, 0).GetValue<uint64_t>();
+	version.graph_version = result->GetValue(1, 0).GetValue<uint64_t>();
+	if (!result->GetValue(2, 0).IsNull() &&
+	    StringUtil::CIEquals(result->GetValue(2, 0).GetValue<string>(), "DUCKLAKE")) {
+		if (result->GetValue(3, 0).IsNull() || result->GetValue(4, 0).IsNull() ||
+		    !StringUtil::CIEquals(result->GetValue(4, 0).GetValue<string>(), "LIVE")) {
+			throw InvalidInputException("DuckLake graph '%s' has incomplete snapshot metadata", graph_name);
+		}
+		version.source_catalog = result->GetValue(3, 0).GetValue<string>();
+		version.source_snapshot_id = ReadDuckLakeSnapshot(connection, version.source_catalog);
+		version.has_source_snapshot = true;
+	}
+	return version;
+}
+
+static bool SameGraphVersion(const GraphVersion &left, const GraphVersion &right) {
+	return left.graph_id == right.graph_id && left.graph_version == right.graph_version &&
+	       left.has_source_snapshot == right.has_source_snapshot &&
+	       (!left.has_source_snapshot || (left.source_snapshot_id == right.source_snapshot_id &&
+	                                      StringUtil::CIEquals(left.source_catalog, right.source_catalog)));
 }
 
 static void FinalizeOffsets(vector<uint64_t> &offsets) {
@@ -267,18 +300,34 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 	auto graph = ReadGraphVersion(connection, graph_name);
 	snapshot->graph_id = graph.graph_id;
 	snapshot->graph_version = graph.graph_version;
+	snapshot->has_source_snapshot = graph.has_source_snapshot;
+	snapshot->source_snapshot_id = graph.source_snapshot_id;
+	snapshot->source_catalog = graph.source_catalog;
 
 	auto vertex_count = GqlQuery(connection, "SELECT count(*)::UBIGINT FROM " + QualifiedTable(binding.vertex));
 	snapshot->vertex_ids.reserve(NumericCast<idx_t>(vertex_count->GetValue(0, 0).GetValue<uint64_t>()));
-	auto vertex_label_projection =
-	    !build_vertex_labels || binding.vertex.label_column.empty() ? "CAST(NULL AS VARCHAR[])"
-	    : binding.vertex.label_is_list
-	        ? GqlQuoteIdentifier(binding.vertex.label_column)
-	        : "string_split(CAST(" + GqlQuoteIdentifier(binding.vertex.label_column) + " AS VARCHAR), ';')";
-	auto vertices = connection.SendQuery("SELECT CAST(" + GqlQuoteIdentifier(binding.vertex.key_column) +
-	                                     " AS UBIGINT) AS vertex_id, " + vertex_label_projection +
-	                                     ", CAST(rowid AS UBIGINT) AS physical_rowid FROM " +
-	                                     QualifiedTable(binding.vertex) + " ORDER BY vertex_id");
+	string vertex_label_projection = "CAST(NULL AS VARCHAR[])";
+	if (build_vertex_labels && !binding.vertex.static_labels.empty()) {
+		vertex_label_projection = "[";
+		for (idx_t index = 0; index < binding.vertex.static_labels.size(); index++) {
+			if (index > 0) {
+				vertex_label_projection += ", ";
+			}
+			vertex_label_projection += GqlQuoteLiteral(binding.vertex.static_labels[index]);
+		}
+		vertex_label_projection += "]::VARCHAR[]";
+	} else if (build_vertex_labels && !binding.vertex.label_column.empty()) {
+		vertex_label_projection =
+		    binding.vertex.label_is_list
+		        ? GqlQuoteIdentifier(binding.vertex.label_column)
+		        : "string_split(CAST(" + GqlQuoteIdentifier(binding.vertex.label_column) + " AS VARCHAR), ';')";
+	}
+	auto vertex_rowid_projection =
+	    StringUtil::CIEquals(binding.vertex.ownership, "MANAGED") ? "CAST(rowid AS UBIGINT)" : "CAST(0 AS UBIGINT)";
+	auto vertices =
+	    connection.SendQuery("SELECT CAST(" + GqlQuoteIdentifier(binding.vertex.key_column) +
+	                         " AS UBIGINT) AS vertex_id, " + vertex_label_projection + ", " + vertex_rowid_projection +
+	                         " AS physical_rowid FROM " + QualifiedTable(binding.vertex) + " ORDER BY vertex_id");
 	GqlThrowOnError(*vertices);
 	snapshot->vertex_ids_match_rowids = StringUtil::CIEquals(binding.vertex.ownership, "MANAGED");
 	if (build_vertex_labels) {
@@ -376,9 +425,12 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 		}
 	}
 
-	auto label_projection = !build_edge_labels || binding.edge.label_column.empty()
-	                            ? "CAST(NULL AS VARCHAR)"
-	                            : "CAST(" + GqlQuoteIdentifier(binding.edge.label_column) + " AS VARCHAR)";
+	string label_projection = "CAST(NULL AS VARCHAR)";
+	if (build_edge_labels && !binding.edge.static_labels.empty()) {
+		label_projection = GqlQuoteLiteral(binding.edge.static_labels[0]);
+	} else if (build_edge_labels && !binding.edge.label_column.empty()) {
+		label_projection = "CAST(" + GqlQuoteIdentifier(binding.edge.label_column) + " AS VARCHAR)";
+	}
 	auto edge_count = GqlQuery(connection, "SELECT count(*)::UBIGINT FROM " + QualifiedTable(binding.edge));
 	auto expected_edges = NumericCast<idx_t>(edge_count->GetValue(0, 0).GetValue<uint64_t>());
 	snapshot->edge_count = expected_edges;
@@ -387,12 +439,13 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 	auto edge_target = "CAST(" + GqlQuoteIdentifier(binding.edge_target_column) + " AS UBIGINT)";
 	auto edge_table = QualifiedTable(binding.edge);
 	auto projected_edge_key = build_edge_ids ? edge_key : "CAST(0 AS UBIGINT)";
-	auto projected_row_id = build_edge_ids ? "CAST(rowid AS UBIGINT)" : "CAST(0 AS UBIGINT)";
+	auto projected_row_id = build_edge_ids && StringUtil::CIEquals(binding.edge.ownership, "MANAGED")
+	                            ? "CAST(rowid AS UBIGINT)"
+	                            : "CAST(0 AS UBIGINT)";
 	auto endpoint_projection = "SELECT " + projected_edge_key + ", " + edge_source + ", " + edge_target + ", " +
 	                           projected_row_id + " FROM " + edge_table;
 	auto edge_projection = "SELECT " + projected_edge_key + ", " + edge_source + ", " + edge_target + ", " +
-	                       label_projection +
-	                       " FROM " + edge_table;
+	                       label_projection + " FROM " + edge_table;
 	// COPY GRAPH owns these tables and generates monotonically unique IDs. Keep
 	// duplicate validation for any future non-managed/table-attachment path,
 	// but do not build an O(E) hash set for the managed fast path.
@@ -434,8 +487,8 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 			auto source_index = source_data.sel->get_index(row);
 			auto target_index = target_data.sel->get_index(row);
 			auto row_id_index = row_id_data.sel->get_index(row);
-			if ((build_edge_ids && (!edge_id_data.validity.RowIsValid(edge_index) ||
-			                       !row_id_data.validity.RowIsValid(row_id_index))) ||
+			if ((build_edge_ids &&
+			     (!edge_id_data.validity.RowIsValid(edge_index) || !row_id_data.validity.RowIsValid(row_id_index))) ||
 			    !source_data.validity.RowIsValid(source_index) || !target_data.validity.RowIsValid(target_index)) {
 				throw InvalidInputException("Table-backed CSR edge keys and endpoints "
 				                            "must not contain NULL values");
@@ -634,7 +687,8 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 	    snapshot->vertex_label_postings.AllocatedBytes() + snapshot->outgoing_label_ids.AllocatedBytes() +
 	    snapshot->incoming_label_ids.AllocatedBytes() + LabelDictionaryStorageBytes(snapshot->label_ids);
 	snapshot->auxiliary_bytes = sizeof(GqlCsrSnapshot) + HashContainerStorageBytes(snapshot->ordinal_by_id) +
-	                            snapshot->vertex_table_key.capacity() + snapshot->edge_table_key.capacity() +
+	                            snapshot->source_catalog.capacity() + snapshot->vertex_table_key.capacity() +
+	                            snapshot->edge_table_key.capacity() +
 	                            snapshot->edge_label_stats.capacity() * sizeof(GqlCsrEdgeLabelStats);
 	snapshot->build_auxiliary_bytes =
 	    transient_vertex_id_bytes + outgoing_cursor.capacity() * sizeof(uint64_t) +
@@ -643,11 +697,20 @@ static shared_ptr<GqlCsrSnapshot> BuildTableSnapshot(ClientContext &context, con
 	snapshot->memory_bytes =
 	    snapshot->topology_bytes + snapshot->identity_bytes + snapshot->label_bytes + snapshot->auxiliary_bytes;
 	connection.Commit();
+	Connection validation_connection(*context.db);
+	auto current_graph = ReadGraphVersion(validation_connection, graph_name);
+	if (!SameGraphVersion(graph, current_graph)) {
+		throw InvalidInputException("Graph '%s' changed while its CSR snapshot was being built; retry the operation",
+		                            graph_name);
+	}
 	return snapshot;
 }
 
 static bool CsrSnapshotIsCurrent(ClientContext &context, const GqlCsrSnapshot &snapshot, const GraphVersion &graph) {
 	return snapshot.graph_id == graph.graph_id && snapshot.graph_version == graph.graph_version &&
+	       snapshot.has_source_snapshot == graph.has_source_snapshot &&
+	       (!snapshot.has_source_snapshot || (snapshot.source_snapshot_id == graph.source_snapshot_id &&
+	                                          StringUtil::CIEquals(snapshot.source_catalog, graph.source_catalog))) &&
 	       snapshot.write_generation == ReadCsrWriteGeneration(context) &&
 	       snapshot.vertex_write_generation == ReadCsrTableWriteGeneration(context, snapshot.vertex_table_key) &&
 	       snapshot.edge_write_generation == ReadCsrTableWriteGeneration(context, snapshot.edge_table_key);
@@ -705,6 +768,10 @@ static shared_ptr<GqlCsrSnapshot> PublishTableSnapshot(GqlDerivedGraphStorageSta
 	                               [&](const shared_ptr<GqlCsrSnapshot> &entry) {
 		                               const bool stale =
 		                                   entry->graph_version != snapshot->graph_version ||
+		                                   entry->has_source_snapshot != snapshot->has_source_snapshot ||
+		                                   (entry->has_source_snapshot &&
+		                                    (entry->source_snapshot_id != snapshot->source_snapshot_id ||
+		                                     !StringUtil::CIEquals(entry->source_catalog, snapshot->source_catalog))) ||
 		                                   entry->write_generation != snapshot->write_generation ||
 		                                   entry->vertex_write_generation != snapshot->vertex_write_generation ||
 		                                   entry->edge_write_generation != snapshot->edge_write_generation;
@@ -1404,13 +1471,16 @@ static unique_ptr<FunctionData> CsrStatsBind(ClientContext &, TableFunctionBindI
 	         "has_vertex_label_postings",
 	         "has_edge_stats",
 	         "has_out_degrees",
-	         "snapshot_acquisition_count"};
-	return_types = {
-	    LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
-	    LogicalType::UBIGINT, LogicalType::BOOLEAN, LogicalType::UBIGINT, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	    LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
-	    LogicalType::UBIGINT, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
-	    LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::UBIGINT};
+	         "snapshot_acquisition_count",
+	         "source_catalog",
+	         "source_snapshot_id"};
+	return_types = {LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::BOOLEAN, LogicalType::UBIGINT,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN, LogicalType::BOOLEAN,
+	                LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::UBIGINT};
 	return std::move(result);
 }
 
@@ -1502,6 +1572,8 @@ static void CsrStatsFunction(ClientContext &context, TableFunctionInput &input, 
 	    23, 0,
 	    Value::BOOLEAN((snapshot->capabilities & GQL_CSR_OUT_DEGREES) || (snapshot->capabilities & GQL_CSR_OUTGOING)));
 	output.SetValue(24, 0, Value::UBIGINT(storage->acquisition_count.load()));
+	output.SetValue(25, 0, snapshot->has_source_snapshot ? Value(snapshot->source_catalog) : Value());
+	output.SetValue(26, 0, snapshot->has_source_snapshot ? Value::UBIGINT(snapshot->source_snapshot_id) : Value());
 	state.done = true;
 }
 

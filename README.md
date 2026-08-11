@@ -19,6 +19,8 @@ storage and execution engine, plus an explicit CSR layer for graph algorithms.
 ## What works today
 
 - Managed property graphs backed by typed DuckDB vertex and edge tables.
+- Read-only, zero-copy typed graph projections over existing DuckDB and
+  DuckLake tables, with live DuckLake snapshot-aware CSR invalidation.
 - Graph-header CSV, compressed CSV, and Parquet bulk import.
 - Directed `MATCH`, `OPTIONAL MATCH`, filtering, projection, aggregation,
   ordering, paging, fixed multi-hop paths, and a bounded variable-length path
@@ -293,6 +295,78 @@ uses these database-scoped statistics to compare a correlated CSR frontier
 with a bulk edge-table scan and to avoid treating a highly skewed one-row
 endpoint as uniformly selective.
 
+## DuckLake-backed graphs (preview)
+
+The `v0.2.0-alpha.1` preview can map selected columns from existing DuckLake
+tables into a typed graph without copying their rows into DuckGQL-owned
+storage. DuckLake remains authoritative; DuckGQL stores only the typed graph
+schema, column mappings, source identity, and derived in-memory CSR snapshots.
+The Community Extensions build remains on the stable `0.1.1` descriptor while
+this preview gathers feedback; build this tag from source or use its matching
+GitHub Actions artifact.
+
+```sql
+INSTALL ducklake;
+LOAD ducklake;
+LOAD duckgql;
+
+ATTACH 'ducklake:lakehouse.ducklake' AS lake;
+
+CREATE GRAPH social TYPED {
+    (Person :Person {id INT64 NOT NULL, name STRING, age INT64}),
+    (Person)-[:KNOWS {id INT64 NOT NULL, since INT32}]->(Person)
+}
+FROM TABLES (
+    VERTEX TABLE lake.main.person
+        MAP TO NODE TYPE Person
+        KEY (person_id)
+        PROPERTIES (
+            person_id AS id,
+            full_name AS name,
+            age_years AS age
+        ),
+    EDGE TABLE lake.main.person_knows
+        MAP TO EDGE TYPE KNOWS
+        KEY (relationship_id)
+        SOURCE (src_person_id) REFERENCES NODE TYPE Person
+        DESTINATION (dst_person_id) REFERENCES NODE TYPE Person
+        PROPERTIES (
+            relationship_id AS id,
+            since_year AS since
+        )
+)
+OPTIONS (
+    SNAPSHOT_POLICY 'LIVE',
+    ACCESS_MODE 'READ_ONLY',
+    VALIDATE TRUE
+);
+
+SESSION SET GRAPH social;
+
+MATCH (a:Person)-[e:KNOWS]->(b:Person)
+RETURN a.name, b.name, e.since;
+
+CALL algo.pagerank('social')
+YIELD vertex_id, rank
+RETURN vertex_id, rank
+ORDER BY rank DESC;
+```
+
+Only mapped columns are visible through GQL. DuckGQL records DuckLake's
+persistent table UUIDs plus the mapped column names, types, and nullability.
+Replacing a source table or incompatibly changing a mapped column rejects the
+graph at bind time. Adding an unmapped source column remains compatible. A live
+DuckLake snapshot change invalidates cached CSR topology, and the next
+algorithm call rebuilds the required projection automatically.
+
+This preview supports one vertex table and one edge table from the same
+catalog, one statically mapped node type, one statically mapped edge type,
+integer keys, both endpoints targeting that node type, `LIVE` snapshots, and
+read-only GQL access. Pinned snapshots, multiple element tables, heterogeneous
+endpoints, string/composite IDs, predicate mappings, weighted algorithms, and
+write-through mutations are not included yet. Mapped table names must currently
+be unique across schemas within a DuckLake catalog.
+
 ## Storage model
 
 DuckGQL uses one canonical storage model:
@@ -364,11 +438,9 @@ python3 scripts/benchmark/benchmark_snb_gql_interactive.py \
   --query-timeout 180
 ```
 
-DuckLake tables can be used as an input source by exporting graph-header
-relations to Parquet and loading those files with `COPY GRAPH`. Direct
-zero-copy DuckLake-backed graphs are not supported yet because DuckGQL
-currently owns its native graph tables and internal catalog. A future
-read-only referenced-table mode is planned.
+For owned graphs, DuckLake tables can still be exported to graph-header Parquet
+and loaded with `COPY GRAPH`. The preview referenced-table mode above is the
+zero-copy, read-only alternative.
 
 ## Current limitations
 
@@ -387,8 +459,9 @@ read-only referenced-table mode is planned.
 - Path modes, searches, shortest-path groups, query composition, procedure
   semantics, named graph types, typed storage enforcement, and the complete
   GQL value/type system remain incomplete.
-- Direct registration of existing DuckDB or DuckLake tables as a graph is not
-  exposed.
+- Referenced graphs currently support one vertex table and one edge table,
+  integer identity, static types, live snapshots, and read-only access. Pinned
+  snapshots and heterogeneous multi-table projections are not yet supported.
 
 The machine-readable status is
 [`test/conformance/iso-gql-2024.tsv`](test/conformance/iso-gql-2024.tsv). The

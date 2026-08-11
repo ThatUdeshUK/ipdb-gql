@@ -188,6 +188,9 @@ struct GqlCsrSnapshot {
 	uint64_t write_generation;
 	uint64_t vertex_write_generation;
 	uint64_t edge_write_generation;
+	bool has_source_snapshot = false;
+	uint64_t source_snapshot_id = 0;
+	string source_catalog;
 	string vertex_table_key;
 	string edge_table_key;
 	bool dense_vertex_ids = false;

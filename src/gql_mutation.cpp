@@ -504,6 +504,11 @@ static GqlTableGraphBinding LoadSelectedGraph(ClientContext &context) {
 	if (!GqlTryLoadTableGraph(context, graph_name, graph)) {
 		throw InvalidInputException("Graph '%s' has no managed native tables; load it with COPY GRAPH", graph_name);
 	}
+	if (!StringUtil::CIEquals(graph.vertex.ownership, "MANAGED") ||
+	    !StringUtil::CIEquals(graph.edge.ownership, "MANAGED")) {
+		throw InvalidInputException("Graph '%s' is a read-only referenced graph; mutate its source tables with SQL",
+		                            graph_name);
+	}
 	return graph;
 }
 

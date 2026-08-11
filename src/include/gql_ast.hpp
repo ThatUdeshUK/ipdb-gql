@@ -255,6 +255,32 @@ struct GqlGraphSchemaDefinition {
 	vector<GqlGraphElementDefinition> elements;
 };
 
+struct GqlGraphPropertyColumnMapping {
+	GqlIdentifier source_column;
+	GqlIdentifier property_name;
+};
+
+struct GqlGraphElementTableMapping {
+	GqlPatternElementType kind = GqlPatternElementType::VERTEX;
+	string qualified_table;
+	GqlIdentifier schema_type;
+	GqlIdentifier key_column;
+	GqlIdentifier source_column;
+	GqlIdentifier target_column;
+	GqlIdentifier source_schema_type;
+	GqlIdentifier target_schema_type;
+	vector<GqlGraphPropertyColumnMapping> properties;
+};
+
+struct GqlReferencedGraphDefinition {
+	bool present = false;
+	GqlGraphElementTableMapping vertex;
+	GqlGraphElementTableMapping edge;
+	string snapshot_policy = "LIVE";
+	string access_mode = "READ_ONLY";
+	bool validate = true;
+};
+
 class GqlStatement {
 public:
 	GqlStatement(GqlStatementType type_p, GqlSourceRange source_p) : type(type_p), source(std::move(source_p)) {
@@ -286,6 +312,7 @@ public:
 	GqlIdentifier graph_name;
 	bool if_not_exists;
 	GqlGraphSchemaDefinition schema;
+	GqlReferencedGraphDefinition referenced;
 };
 
 class GqlCopyGraphStatement final : public GqlStatement {

@@ -100,6 +100,7 @@ struct RelationalPropertyAccess {
 	string table_alias;
 	string column_name;
 	bool is_list = false;
+	vector<string> static_labels;
 };
 
 struct RelationalIdentityAccess {
@@ -555,7 +556,7 @@ static void CollectProperties(const GqlExpressionProgram &program, RelationalPro
 		                           : program.properties[node]);
 		if (aliases.find(key) == aliases.end()) {
 			auto alias = "gql_op_" + to_string(aliases.size());
-			aliases.emplace(std::move(key), RelationalPropertyAccess {std::move(alias), "value", false});
+			aliases.emplace(std::move(key), RelationalPropertyAccess {std::move(alias), "value", false, {}});
 		}
 	}
 }
@@ -654,6 +655,36 @@ static unique_ptr<ParsedExpression> ElementHasLabel(const string &table_alias, c
 	return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE, std::move(coalesce_arguments));
 }
 
+static bool StaticHasLabel(const vector<string> &labels, const string &label) {
+	for (const auto &candidate : labels) {
+		if (StringUtil::CIEquals(candidate, label)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static unique_ptr<ParsedExpression> ElementHasLabel(const string &table_alias, const GqlElementTableBinding &table,
+                                                    const string &label) {
+	if (!table.static_labels.empty()) {
+		return Constant(Value(StaticHasLabel(table.static_labels, label)));
+	}
+	if (table.label_column.empty()) {
+		return Constant(Value(false));
+	}
+	return ElementHasLabel(table_alias, table.label_column, table.label_is_list, label);
+}
+
+static unique_ptr<ParsedExpression> ElementHasLabel(const RelationalPropertyAccess &access, const string &label) {
+	if (!access.static_labels.empty()) {
+		return Constant(Value(StaticHasLabel(access.static_labels, label)));
+	}
+	if (access.column_name.empty()) {
+		return Constant(Value(false));
+	}
+	return ElementHasLabel(access.table_alias, access.column_name, access.is_list, label);
+}
+
 static unique_ptr<ParsedExpression> LowerExpression(const GqlExpressionProgram &program, idx_t &cursor,
                                                     const RelationalPropertyMap &property_aliases,
                                                     const vector<RelationalIdentityAccess> &identities,
@@ -732,13 +763,12 @@ static unique_ptr<ParsedExpression> LowerExpression(const GqlExpressionProgram &
 		auto input = LowerExpression(program, cursor, property_aliases, identities);
 		(void)input;
 		auto entry = property_aliases.find(PropertyKey(program.binding_indices[node], GQL_LABEL_ACCESS));
-		if (entry == property_aliases.end() || entry->second.column_name.empty()) {
+		if (entry == property_aliases.end()) {
 			return Constant(Value(program.operators[node] != 0));
 		}
 		vector<unique_ptr<ParsedExpression>> predicates;
 		for (const auto &label : StringUtil::Split(program.properties[node], ';')) {
-			predicates.push_back(
-			    ElementHasLabel(entry->second.table_alias, entry->second.column_name, entry->second.is_list, label));
+			predicates.push_back(ElementHasLabel(entry->second, label));
 		}
 		auto result = And(std::move(predicates));
 		if (program.operators[node] != 0) {
@@ -915,12 +945,7 @@ static unique_ptr<TableRef> RelationalPathExpansionTable(const GqlTableGraphBind
 				conditions.push_back(Equal(Column(aliases.back(), end_column), Column(alias, start_column)));
 				AppendJoin(from, ElementTable(graph.edge, alias), JoinType::INNER, std::move(conditions));
 			}
-			if (graph.edge.label_column.empty()) {
-				filters.push_back(Constant(Value(false)));
-			} else {
-				filters.push_back(
-				    ElementHasLabel(alias, graph.edge.label_column, graph.edge.label_is_list, path.edge_label));
-			}
+			filters.push_back(ElementHasLabel(alias, graph.edge, path.edge_label));
 			for (const auto &prior_alias : aliases) {
 				filters.push_back(
 				    NotEqual(Column(alias, graph.edge.key_column), Column(prior_alias, graph.edge.key_column)));
@@ -1018,8 +1043,19 @@ static unique_ptr<ParsedExpression> GraphElementValueAt(const GqlExpressionProgr
 	AppendStructField(fields, Column(alias, table.key_column),
 	                  expected == GqlPatternElementType::VERTEX ? "vertex_id" : "edge_id");
 	if (expected == GqlPatternElementType::VERTEX) {
-		unique_ptr<ParsedExpression> labels =
-		    table.label_column.empty() ? Constant(Value()) : Column(alias, table.label_column);
+		unique_ptr<ParsedExpression> labels;
+		if (!table.static_labels.empty()) {
+			string joined;
+			for (idx_t index = 0; index < table.static_labels.size(); index++) {
+				if (index > 0) {
+					joined += ";";
+				}
+				joined += table.static_labels[index];
+			}
+			labels = Constant(Value(joined));
+		} else {
+			labels = table.label_column.empty() ? Constant(Value()) : Column(alias, table.label_column);
+		}
 		if (!table.label_column.empty() && table.label_is_list) {
 			vector<unique_ptr<ParsedExpression>> arguments;
 			arguments.push_back(std::move(labels));
@@ -1028,8 +1064,10 @@ static unique_ptr<ParsedExpression> GraphElementValueAt(const GqlExpressionProgr
 		}
 		AppendStructField(fields, std::move(labels), "__gql_labels");
 	} else {
-		AppendStructField(fields, table.label_column.empty() ? Constant(Value()) : Column(alias, table.label_column),
-		                  "__gql_type");
+		auto edge_type = !table.static_labels.empty() ? Constant(Value(table.static_labels[0]))
+		                 : table.label_column.empty() ? Constant(Value())
+		                                              : Column(alias, table.label_column);
+		AppendStructField(fields, std::move(edge_type), "__gql_type");
 		AppendStructField(fields, Column(alias, graph.edge_source_column), "__gql_source");
 		AppendStructField(fields, Column(alias, graph.edge_target_column), "__gql_target");
 	}
@@ -1246,6 +1284,13 @@ static bool TryFindPropertyColumn(const GqlElementTableBinding &table, const str
 	return false;
 }
 
+static void FindPropertyColumn(const GqlElementTableBinding &table, const string &property, string &column) {
+	if (!TryFindPropertyColumn(table, property, column) && table.ownership == "REFERENCED") {
+		throw BinderException("Property '%s' is not mapped for referenced graph table '%s.%s.%s'", property,
+		                      table.catalog_name, table.schema_name, table.table_name);
+	}
+}
+
 static bool ReferencesOnlyBinding(const GqlExpressionProgram &program, idx_t binding_index) {
 	for (const auto index : program.binding_indices) {
 		if (index != NumericLimits<uint64_t>::Maximum() && index != binding_index) {
@@ -1310,8 +1355,9 @@ static unique_ptr<TableRef> TableBackedNativeRecursiveMatch(const GqlTableGraphB
 		if (property == GQL_LABEL_ACCESS) {
 			entry.second.column_name = graph.vertex.label_column;
 			entry.second.is_list = graph.vertex.label_is_list;
+			entry.second.static_labels = graph.vertex.static_labels;
 		} else {
-			TryFindPropertyColumn(graph.vertex, property, entry.second.column_name);
+			FindPropertyColumn(graph.vertex, property, entry.second.column_name);
 		}
 	}
 
@@ -1323,12 +1369,7 @@ static unique_ptr<TableRef> TableBackedNativeRecursiveMatch(const GqlTableGraphB
 	anchor->from_table = ElementTable(graph.vertex, anchor_alias);
 	vector<unique_ptr<ParsedExpression>> anchor_filters;
 	for (const auto &label : match.source_labels) {
-		if (graph.vertex.label_column.empty()) {
-			anchor_filters.push_back(Constant(Value(false)));
-		} else {
-			anchor_filters.push_back(
-			    ElementHasLabel(anchor_alias, graph.vertex.label_column, graph.vertex.label_is_list, label));
-		}
+		anchor_filters.push_back(ElementHasLabel(anchor_alias, graph.vertex, label));
 	}
 	vector<RelationalIdentityAccess> anchor_identities(match.binding_count);
 	anchor_identities[match.source_binding] = {anchor_alias, graph.vertex.key_column};
@@ -1382,12 +1423,7 @@ static unique_ptr<TableRef> TableBackedNativeRecursiveMatch(const GqlTableGraphB
 	step_filters.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT,
 	                                                     Function("list_contains", std::move(contains_arguments))));
 	for (const auto &label : match.edge_labels) {
-		if (graph.edge.label_column.empty()) {
-			step_filters.push_back(Constant(Value(false)));
-		} else {
-			step_filters.push_back(
-			    ElementHasLabel(edge_alias, graph.edge.label_column, graph.edge.label_is_list, label));
-		}
+		step_filters.push_back(ElementHasLabel(edge_alias, graph.edge, label));
 	}
 
 	auto step = make_uniq<SelectNode>();
@@ -1447,12 +1483,7 @@ static unique_ptr<TableRef> TableBackedNativeRecursiveMatch(const GqlTableGraphB
 	}
 	auto append_labels = [&](const vector<string> &labels, idx_t binding_index) {
 		for (const auto &label : labels) {
-			if (graph.vertex.label_column.empty()) {
-				filters.push_back(Constant(Value(false)));
-			} else {
-				filters.push_back(ElementHasLabel(identities[binding_index].table_alias, graph.vertex.label_column,
-				                                  graph.vertex.label_is_list, label));
-			}
+			filters.push_back(ElementHasLabel(identities[binding_index].table_alias, graph.vertex, label));
 		}
 	};
 	append_labels(match.target_labels, match.target_binding);
@@ -1521,8 +1552,9 @@ static unique_ptr<TableRef> TableBackedMatch(ClientContext &context, const strin
 		if (property == GQL_LABEL_ACCESS) {
 			entry.second.column_name = table.label_column;
 			entry.second.is_list = table.label_is_list;
+			entry.second.static_labels = table.static_labels;
 		} else {
-			TryFindPropertyColumn(table, property, entry.second.column_name);
+			FindPropertyColumn(table, property, entry.second.column_name);
 		}
 	}
 
@@ -1623,24 +1655,20 @@ static unique_ptr<TableRef> TableBackedMatch(ClientContext &context, const strin
 					continue;
 				}
 				const auto &table = element.type == GqlPatternElementType::EDGE ? graph.edge : graph.vertex;
-				if (table.label_column.empty()) {
-					result.conditions.push_back(Constant(Value(false)));
-				} else {
-					for (const auto &label : StringUtil::Split(element.label, ';')) {
-						const auto &postings = stage_plan.bindings[element.binding_index].label_postings;
-						bool posting_selected = false;
-						for (const auto &posting : postings) {
-							if (StringUtil::CIEquals(posting, label)) {
-								posting_selected = true;
-								break;
-							}
+				for (const auto &label : StringUtil::Split(element.label, ';')) {
+					const auto &postings = stage_plan.bindings[element.binding_index].label_postings;
+					bool posting_selected = false;
+					for (const auto &posting : postings) {
+						if (StringUtil::CIEquals(posting, label)) {
+							posting_selected = true;
+							break;
 						}
-						if (element.type == GqlPatternElementType::VERTEX && posting_selected) {
-							continue;
-						}
-						result.conditions.push_back(ElementHasLabel(identities[element.binding_index].table_alias,
-						                                            table.label_column, table.label_is_list, label));
 					}
+					if (element.type == GqlPatternElementType::VERTEX && posting_selected) {
+						continue;
+					}
+					result.conditions.push_back(
+					    ElementHasLabel(identities[element.binding_index].table_alias, table, label));
 				}
 			}
 			for (idx_t element_index = 1; element_index < pattern.elements.size(); element_index += 2) {
