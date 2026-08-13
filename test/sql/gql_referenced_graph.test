@@ -293,8 +293,9 @@ SELECT count(*) FROM gql_internal.graphs WHERE graph_name = 'invalid_mapping'
 0
 
 # Multiple physical vertex tables form one heterogeneous logical vertex
-# relation. Source keys remain element IDs, so their values share one graph-wide
-# namespace. Edge endpoints resolve through the declared node types.
+# relation. Source keys are unique within their node-type mapping. DuckGQL
+# assigns graph-wide snapshot-local IDs and resolves endpoints through the
+# declared node types.
 statement ok
 CREATE TABLE lake.main.customer (
     customer_id BIGINT NOT NULL,
@@ -408,19 +409,42 @@ Mouse
 statement ok
 DROP GRAPH commerce
 
-# Source keys from different vertex tables may not collide because
-# element_id(node) continues to expose the source key.
+# Source keys may overlap across node types and edge types. Their type-qualified
+# source identities remain distinct, while element_id() exposes DuckGQL's dense
+# snapshot-local graph identity.
 statement ok
 CREATE TABLE lake.main.duplicate_product (product_id BIGINT NOT NULL)
 
 statement ok
 INSERT INTO lake.main.duplicate_product VALUES (1), (101), (102), (103)
 
-statement error
+statement ok
+CREATE TABLE lake.main.viewed (
+    view_id BIGINT NOT NULL,
+    customer_id BIGINT NOT NULL,
+    product_id BIGINT NOT NULL
+)
+
+statement ok
+INSERT INTO lake.main.viewed VALUES (1001, 1, 1)
+
+statement ok
+CREATE TABLE lake.main.wishlisted (
+    wish_id BIGINT NOT NULL,
+    customer_id BIGINT NOT NULL,
+    product_id BIGINT NOT NULL
+)
+
+statement ok
+INSERT INTO lake.main.wishlisted VALUES (1001, 1, 101)
+
+query IT
 CREATE GRAPH duplicate_ids TYPED {
     (Customer :Customer {id INT64 NOT NULL}),
     (Item :Item {id INT64 NOT NULL}),
-    (Customer)-[:BOUGHT {id INT64 NOT NULL}]->(Item)
+    (Customer)-[:BOUGHT {id INT64 NOT NULL}]->(Item),
+    (Customer)-[:VIEWED {id INT64 NOT NULL}]->(Item),
+    (Customer)-[:WISHLISTED {id INT64 NOT NULL}]->(Item)
 }
 FROM TABLES (
     VERTEX TABLE lake.main.customer
@@ -431,12 +455,52 @@ FROM TABLES (
         MAP TO EDGE TYPE BOUGHT KEY (order_id)
         SOURCE (customer_id) REFERENCES NODE TYPE Customer
         DESTINATION (product_id) REFERENCES NODE TYPE Item
-        PROPERTIES (order_id AS id)
+        PROPERTIES (order_id AS id),
+    EDGE TABLE lake.main.viewed
+        MAP TO EDGE TYPE VIEWED
+        SOURCE (customer_id) REFERENCES NODE TYPE Customer
+        DESTINATION (product_id) REFERENCES NODE TYPE Item
+        PROPERTIES (view_id AS id),
+    EDGE TABLE lake.main.wishlisted
+        MAP TO EDGE TYPE WISHLISTED KEY (wish_id)
+        SOURCE (customer_id) REFERENCES NODE TYPE Customer
+        DESTINATION (product_id) REFERENCES NODE TYPE Item
+        PROPERTIES (wish_id AS id)
 )
 ----
-<REGEX>:.*vertex keys must be unique across all mapped tables.*
+true	duplicate_ids
 
-query I
-SELECT count(*) FROM gql_internal.graphs WHERE graph_name = 'duplicate_ids'
+statement ok
+SESSION SET GRAPH duplicate_ids
+
+query II
+MATCH (customer:Customer), (item:Item)
+WHERE customer.id = 1 AND item.id = 1
+RETURN element_id(customer), element_id(item)
 ----
-0
+1	3
+
+query IIII
+MATCH (customer:Customer)-[:VIEWED]->(item:Item)
+RETURN customer.id, item.id, element_id(customer), element_id(item)
+----
+1	1	1	3
+
+query II
+MATCH ()-[relationship]->()
+RETURN relationship.id, element_id(relationship)
+ORDER BY element_id(relationship)
+----
+1001	1
+1002	2
+1003	3
+1001	4
+1001	5
+
+statement ok
+CALL gql_build_csr('duplicate_ids')
+
+query II
+SELECT vertex_count, edge_count FROM gql_csr_stats('duplicate_ids')
+----
+6	5

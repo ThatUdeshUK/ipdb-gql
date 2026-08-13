@@ -785,14 +785,20 @@ static unique_ptr<FunctionData> CreateGraphBind(ClientContext &, TableFunctionBi
 			throw BinderException("Invalid referenced graph mapping payload");
 		}
 		for (idx_t index = 0; index < mapping_count; index++) {
-			if ((mapping_kinds[index] != "VERTEX" && mapping_kinds[index] != "EDGE") ||
-			    mapping_tables[index].empty() || mapping_schema_types[index].empty() || mapping_keys[index].empty()) {
+			if ((mapping_kinds[index] != "VERTEX" && mapping_kinds[index] != "EDGE") || mapping_tables[index].empty() ||
+			    mapping_schema_types[index].empty() ||
+			    (mapping_kinds[index] == "VERTEX" && mapping_keys[index].empty())) {
 				throw BinderException("Invalid referenced graph element mapping payload");
 			}
-			referenced_mapping.elements.push_back(
-			    {mapping_kinds[index], mapping_tables[index], mapping_schema_types[index], mapping_keys[index],
-			     mapping_sources[index], mapping_targets[index], mapping_source_schema_types[index],
-			     mapping_target_schema_types[index], {}});
+			referenced_mapping.elements.push_back({mapping_kinds[index],
+			                                       mapping_tables[index],
+			                                       mapping_schema_types[index],
+			                                       mapping_keys[index],
+			                                       mapping_sources[index],
+			                                       mapping_targets[index],
+			                                       mapping_source_schema_types[index],
+			                                       mapping_target_schema_types[index],
+			                                       {}});
 		}
 		for (idx_t index = 0; index < mapping_property_indices.size(); index++) {
 			if (mapping_property_indices[index] >= mapping_count) {

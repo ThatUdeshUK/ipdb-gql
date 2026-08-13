@@ -1074,10 +1074,14 @@ private:
 		ExpectKeyword(expected_kind == GqlPatternElementType::VERTEX ? "NODE" : "EDGE");
 		ExpectKeyword("TYPE");
 		result.schema_type = ParseIdentifier();
-		ExpectKeyword("KEY");
-		ExpectCharacter('(');
-		result.key_column = ParseIdentifier();
-		ExpectCharacter(')');
+		if (expected_kind == GqlPatternElementType::VERTEX || ConsumeKeyword("KEY")) {
+			if (expected_kind == GqlPatternElementType::VERTEX) {
+				ExpectKeyword("KEY");
+			}
+			ExpectCharacter('(');
+			result.key_column = ParseIdentifier();
+			ExpectCharacter(')');
+		}
 		if (expected_kind == GqlPatternElementType::EDGE) {
 			ExpectKeyword("SOURCE");
 			ExpectCharacter('(');

@@ -121,14 +121,15 @@ static void InsertProperties(Connection &connection, uint64_t element_table_id, 
 
 static uint64_t InsertElementTable(Connection &connection, uint64_t graph_id, const char *kind,
                                    const TableDescription &table, const string &key_column, const char *ownership) {
+	auto key_columns = key_column.empty() ? "[]" : "[" + GqlQuoteLiteral(key_column) + "]";
 	auto result = GqlQuery(
 	    connection, "INSERT INTO gql_internal.graph_element_tables "
 	                "(graph_id, element_kind, catalog_name, schema_name, "
 	                "table_name, key_columns, "
 	                "ownership, access_mode) VALUES (" +
 	                    to_string(graph_id) + ", " + GqlQuoteLiteral(kind) + ", " + GqlQuoteLiteral(table.database) +
-	                    ", " + GqlQuoteLiteral(table.schema) + ", " + GqlQuoteLiteral(table.table) + ", [" +
-	                    GqlQuoteLiteral(key_column) + "], " + GqlQuoteLiteral(ownership) + ", " +
+	                    ", " + GqlQuoteLiteral(table.schema) + ", " + GqlQuoteLiteral(table.table) + ", " +
+	                    key_columns + ", " + GqlQuoteLiteral(ownership) + ", " +
 	                    (table.readonly ? "'READ_ONLY'" : "'READ_WRITE'") + ") RETURNING element_table_id");
 	return result->GetValue(0, 0).GetValue<uint64_t>();
 }
@@ -425,8 +426,14 @@ static string BuildReferencedSchemaFingerprint(Connection &connection, uint64_t 
 		AppendFingerprintField(fingerprint, StringUtil::Lower(table->schema));
 		AppendFingerprintField(fingerprint, StringUtil::Lower(table->table));
 		AppendFingerprintField(fingerprint, ReadSourceTableIdentity(connection, *table, source_kind));
-		AppendSourceColumnFingerprint(connection, fingerprint, *table, "KEY",
-		                              ReadSingleColumn(tables->GetValue(5, row), "element key"));
+		auto key_columns_value = tables->GetValue(5, row);
+		const auto &key_columns = ListValue::GetChildren(key_columns_value);
+		if (key_columns.empty() && kind == "EDGE") {
+			AppendFingerprintField(fingerprint, "GENERATED_KEY");
+		} else {
+			AppendSourceColumnFingerprint(connection, fingerprint, *table, "KEY",
+			                              ReadSingleColumn(tables->GetValue(5, row), "element key"));
+		}
 
 		if (kind == "EDGE") {
 			auto endpoints = GqlQuery(connection, "SELECT source_columns, target_columns FROM "
@@ -515,11 +522,16 @@ void GqlAttachReferencedGraphTables(Connection &connection, const string &graph_
 		} else if (!StringUtil::CIEquals(source_catalog, table->database)) {
 			throw BinderException("All referenced graph tables must use the same catalog");
 		}
-		auto &key = ResolveColumn(*table, element.key);
-		if (!IsReferencedKeyType(key.Type())) {
-			throw BinderException("Referenced graph keys must use integer types");
+		const ColumnDefinition *key = nullptr;
+		if (!element.key.empty()) {
+			key = &ResolveColumn(*table, element.key);
+			if (!IsReferencedKeyType(key->Type())) {
+				throw BinderException("Referenced graph keys must use integer types");
+			}
+		} else if (element.kind == "VERTEX") {
+			throw BinderException("Referenced vertex mappings require a source key");
 		}
-		ResolvedMapping entry {&element, std::move(table), &key};
+		ResolvedMapping entry {&element, std::move(table), key};
 		if (element.kind == "VERTEX") {
 			auto normalized_type = StringUtil::Lower(element.schema_type);
 			if (!vertices_by_type.emplace(normalized_type, resolved.size()).second) {
@@ -549,7 +561,7 @@ void GqlAttachReferencedGraphTables(Connection &connection, const string &graph_
 	for (auto &entry : resolved) {
 		entry.schema_id = FindSchemaElement(connection, graph_id, entry.mapping->kind == "VERTEX" ? "NODE" : "EDGE",
 		                                    entry.mapping->schema_type);
-		if (mapping.validate) {
+		if (mapping.validate && entry.key) {
 			ValidateKey(connection, *entry.table, *entry.key);
 		}
 	}
@@ -577,31 +589,9 @@ void GqlAttachReferencedGraphTables(Connection &connection, const string &graph_
 			                 "destination");
 		}
 	}
-	if (mapping.validate) {
-		for (const auto &kind : {string("VERTEX"), string("EDGE")}) {
-			string union_sql;
-			for (const auto &entry : resolved) {
-				if (entry.mapping->kind != kind) {
-					continue;
-				}
-				if (!union_sql.empty()) {
-					union_sql += " UNION ALL ";
-				}
-				union_sql += "SELECT CAST(" + GqlQuoteIdentifier(entry.key->Name()) + " AS HUGEINT) AS id FROM " +
-				             QualifiedTable(*entry.table);
-			}
-			auto uniqueness = GqlQuery(connection, "SELECT count(*)::UBIGINT, count(DISTINCT id)::UBIGINT FROM (" +
-			                                           union_sql + ") mappings");
-			if (uniqueness->GetValue(0, 0).GetValue<uint64_t>() !=
-			    uniqueness->GetValue(1, 0).GetValue<uint64_t>()) {
-				throw InvalidInputException("Referenced %s keys must be unique across all mapped tables",
-				                            StringUtil::Lower(kind));
-			}
-		}
-	}
 	for (auto &entry : resolved) {
 		entry.table_id = InsertElementTable(connection, graph_id, entry.mapping->kind.c_str(), *entry.table,
-		                                    entry.key->Name(), "REFERENCED");
+		                                    entry.key ? entry.key->Name() : string(), "REFERENCED");
 		GqlQuery(connection, "UPDATE gql_internal.graph_element_tables SET access_mode = 'READ_ONLY' WHERE "
 		                     "element_table_id = " +
 		                         to_string(entry.table_id));
@@ -655,9 +645,9 @@ void GqlAttachReferencedGraphTables(Connection &connection, const string &graph_
 	                     "(graph_id, source_kind, source_catalog, snapshot_policy, pinned_snapshot_id, access_mode, "
 	                     "registered_snapshot_id, last_validated_snapshot_id, schema_fingerprint) VALUES (" +
 	                         to_string(graph_id) + ", " + GqlQuoteLiteral(source_kind) + ", " +
-	                         GqlQuoteLiteral(source_catalog) + ", " + GqlQuoteLiteral(mapping.snapshot_policy) +
-	                         ", " + pinned_snapshot + ", " + GqlQuoteLiteral(mapping.access_mode) + ", " + snapshot +
-	                         ", " + (mapping.validate ? snapshot : "NULL") + ", " + GqlQuoteLiteral(fingerprint) + ")");
+	                         GqlQuoteLiteral(source_catalog) + ", " + GqlQuoteLiteral(mapping.snapshot_policy) + ", " +
+	                         pinned_snapshot + ", " + GqlQuoteLiteral(mapping.access_mode) + ", " + snapshot + ", " +
+	                         (mapping.validate ? snapshot : "NULL") + ", " + GqlQuoteLiteral(fingerprint) + ")");
 	GqlQuery(connection, "UPDATE gql_internal.graph_storage SET storage_mode = 'TABLE_BACKED', default_catalog = " +
 	                         GqlQuoteLiteral(source_catalog) +
 	                         ", default_schema = " + GqlQuoteLiteral(resolved[0].table->schema) +
@@ -707,13 +697,13 @@ static const string *FindPropertyColumn(const GqlElementTableBinding &table, con
 
 static vector<pair<string, string>> ReadLogicalProperties(Connection &connection, uint64_t graph_id,
                                                           const string &element_kind) {
-	auto properties = GqlQuery(connection, "SELECT pm.property_name, pm.gql_type FROM "
-	                                       "gql_internal.graph_property_mappings pm JOIN "
-	                                       "gql_internal.graph_element_tables et USING (element_table_id) WHERE "
-	                                       "et.graph_id = " +
-	                                           to_string(graph_id) + " AND et.element_kind = " +
-	                                           GqlQuoteLiteral(element_kind) +
-	                                           " GROUP BY pm.property_name, pm.gql_type ORDER BY lower(pm.property_name)");
+	auto properties =
+	    GqlQuery(connection, "SELECT pm.property_name, pm.gql_type FROM "
+	                         "gql_internal.graph_property_mappings pm JOIN "
+	                         "gql_internal.graph_element_tables et USING (element_table_id) WHERE "
+	                         "et.graph_id = " +
+	                             to_string(graph_id) + " AND et.element_kind = " + GqlQuoteLiteral(element_kind) +
+	                             " GROUP BY pm.property_name, pm.gql_type ORDER BY lower(pm.property_name)");
 	vector<pair<string, string>> result;
 	for (idx_t row = 0; row < properties->RowCount(); row++) {
 		result.emplace_back(properties->GetValue(0, row).GetValue<string>(),
@@ -730,8 +720,46 @@ struct ReferencedPhysicalBinding {
 	string target_column;
 };
 
+static string QualifiedReferencedTable(const GqlElementTableBinding &table) {
+	return GqlQuoteIdentifier(table.catalog_name) + "." + GqlQuoteIdentifier(table.schema_name) + "." +
+	       GqlQuoteIdentifier(table.table_name);
+}
+
+static string ReferencedDenseId(const vector<ReferencedPhysicalBinding> &tables, idx_t table_index,
+                                const string &table_alias) {
+	string expression = "CAST(";
+	for (idx_t index = 0; index < table_index; index++) {
+		expression += "(SELECT count(*)::UBIGINT FROM " + QualifiedReferencedTable(tables[index].table) + ") + ";
+	}
+	auto order_column =
+	    tables[table_index].table.key_column.empty() ? string("rowid") : tables[table_index].table.key_column;
+	expression += "row_number() OVER (ORDER BY " + GqlQuoteIdentifier(table_alias) + "." +
+	              GqlQuoteIdentifier(order_column) + ") AS UBIGINT)";
+	return expression;
+}
+
+static string ReferencedVertexLookup(const vector<ReferencedPhysicalBinding> &vertices, idx_t vertex_index,
+                                     const string &lookup_alias) {
+	auto base_alias = lookup_alias + "_base";
+	return "(SELECT " + GqlQuoteIdentifier(base_alias) + "." +
+	       GqlQuoteIdentifier(vertices[vertex_index].table.key_column) + " AS " +
+	       GqlQuoteIdentifier("__gql_source_key") + ", " + ReferencedDenseId(vertices, vertex_index, base_alias) +
+	       " AS " + GqlQuoteIdentifier("__gql_id") + " FROM " + QualifiedReferencedTable(vertices[vertex_index].table) +
+	       " AS " + GqlQuoteIdentifier(base_alias) + ") AS " + GqlQuoteIdentifier(lookup_alias);
+}
+
+static idx_t FindReferencedVertex(const vector<ReferencedPhysicalBinding> &vertices, uint64_t element_table_id) {
+	for (idx_t index = 0; index < vertices.size(); index++) {
+		if (vertices[index].table.element_table_id == element_table_id) {
+			return index;
+		}
+	}
+	throw InvalidInputException("Referenced edge endpoint names an unknown vertex mapping");
+}
+
 static GqlElementTableBinding BuildReferencedUnion(Connection &connection, uint64_t graph_id, const string &kind,
-                                                   const vector<ReferencedPhysicalBinding> &tables) {
+                                                   const vector<ReferencedPhysicalBinding> &tables,
+                                                   const vector<ReferencedPhysicalBinding> &vertices) {
 	GqlElementTableBinding result;
 	result.catalog_name = tables[0].table.catalog_name;
 	result.schema_name = "gql_internal";
@@ -744,15 +772,17 @@ static GqlElementTableBinding BuildReferencedUnion(Connection &connection, uint6
 	for (const auto &property : properties) {
 		result.property_columns.emplace(property.first, property.first);
 	}
-	for (const auto &entry : tables) {
+	for (idx_t table_index = 0; table_index < tables.size(); table_index++) {
+		auto &entry = tables[table_index];
 		if (entry.table.ownership != "REFERENCED") {
 			throw InvalidInputException("Heterogeneous table-backed graphs require referenced element tables");
 		}
 		if (!result.relation_sql.empty()) {
 			result.relation_sql += " UNION ALL ";
 		}
-		result.relation_sql += "SELECT CAST(" + GqlQuoteIdentifier(entry.table.key_column) +
-		                       " AS UBIGINT) AS " + GqlQuoteIdentifier(result.key_column);
+		auto table_alias = "gql_referenced_" + StringUtil::Lower(kind) + "_" + to_string(table_index);
+		result.relation_sql += "SELECT " + ReferencedDenseId(tables, table_index, table_alias) + " AS " +
+		                       GqlQuoteIdentifier(result.key_column);
 		if (kind == "VERTEX") {
 			result.relation_sql += ", [";
 			for (idx_t label = 0; label < entry.table.static_labels.size(); label++) {
@@ -767,25 +797,35 @@ static GqlElementTableBinding BuildReferencedUnion(Connection &connection, uint6
 				throw InvalidInputException("Referenced edge table contains invalid type or endpoint metadata");
 			}
 			result.relation_sql += ", " + GqlQuoteLiteral(entry.table.static_labels[0]) + " AS " +
-			                       GqlQuoteIdentifier(result.label_column) + ", CAST(" +
-			                       GqlQuoteIdentifier(entry.source_column) + " AS UBIGINT) AS " +
-			                       GqlQuoteIdentifier("__gql_source_id") + ", CAST(" +
-			                       GqlQuoteIdentifier(entry.target_column) + " AS UBIGINT) AS " +
-			                       GqlQuoteIdentifier("__gql_target_id");
+			                       GqlQuoteIdentifier(result.label_column) + ", " +
+			                       GqlQuoteIdentifier("gql_referenced_source") + "." + GqlQuoteIdentifier("__gql_id") +
+			                       " AS " + GqlQuoteIdentifier("__gql_source_id") + ", " +
+			                       GqlQuoteIdentifier("gql_referenced_target") + "." + GqlQuoteIdentifier("__gql_id") +
+			                       " AS " + GqlQuoteIdentifier("__gql_target_id");
 		}
 		for (const auto &property : properties) {
 			auto column = FindPropertyColumn(entry.table, property.first);
 			result.relation_sql += ", ";
 			if (column) {
-				result.relation_sql += GqlQuoteIdentifier(*column);
+				result.relation_sql += GqlQuoteIdentifier(table_alias) + "." + GqlQuoteIdentifier(*column);
 			} else {
 				result.relation_sql += "CAST(NULL AS " + property.second + ")";
 			}
 			result.relation_sql += " AS " + GqlQuoteIdentifier(property.first);
 		}
-		result.relation_sql += " FROM " + GqlQuoteIdentifier(entry.table.catalog_name) + "." +
-		                       GqlQuoteIdentifier(entry.table.schema_name) + "." +
-		                       GqlQuoteIdentifier(entry.table.table_name);
+		result.relation_sql +=
+		    " FROM " + QualifiedReferencedTable(entry.table) + " AS " + GqlQuoteIdentifier(table_alias);
+		if (kind == "EDGE") {
+			auto source_index = FindReferencedVertex(vertices, entry.source_table_id);
+			auto target_index = FindReferencedVertex(vertices, entry.target_table_id);
+			result.relation_sql +=
+			    " LEFT JOIN " + ReferencedVertexLookup(vertices, source_index, "gql_referenced_source") + " ON " +
+			    GqlQuoteIdentifier(table_alias) + "." + GqlQuoteIdentifier(entry.source_column) + " = " +
+			    GqlQuoteIdentifier("gql_referenced_source") + "." + GqlQuoteIdentifier("__gql_source_key") +
+			    " LEFT JOIN " + ReferencedVertexLookup(vertices, target_index, "gql_referenced_target") + " ON " +
+			    GqlQuoteIdentifier(table_alias) + "." + GqlQuoteIdentifier(entry.target_column) + " = " +
+			    GqlQuoteIdentifier("gql_referenced_target") + "." + GqlQuoteIdentifier("__gql_source_key");
+		}
 	}
 	return result;
 }
@@ -834,7 +874,7 @@ bool GqlTryLoadTableGraph(ClientContext &context, const string &graph_name, GqlT
 	    GqlQuery(connection, "SELECT element_table_id, element_kind, catalog_name, schema_name, "
 	                         "table_name, "
 	                         "key_columns, ownership FROM gql_internal.graph_element_tables WHERE graph_id = " +
-	                             to_string(result.graph_id) + " ORDER BY element_kind");
+	                             to_string(result.graph_id) + " ORDER BY element_kind, element_table_id");
 	vector<ReferencedPhysicalBinding> vertex_tables;
 	vector<ReferencedPhysicalBinding> edge_tables;
 	for (idx_t row = 0; row < tables->RowCount(); row++) {
@@ -848,8 +888,14 @@ bool GqlTryLoadTableGraph(ClientContext &context, const string &graph_name, GqlT
 		target->catalog_name = tables->GetValue(2, row).GetValue<string>();
 		target->schema_name = tables->GetValue(3, row).GetValue<string>();
 		target->table_name = tables->GetValue(4, row).GetValue<string>();
-		target->key_column = ReadSingleColumn(tables->GetValue(5, row), "element key");
 		target->ownership = tables->GetValue(6, row).GetValue<string>();
+		auto key_columns_value = tables->GetValue(5, row);
+		const auto &key_columns = ListValue::GetChildren(key_columns_value);
+		if (kind == "EDGE" && target->ownership == "REFERENCED" && key_columns.empty()) {
+			target->key_column.clear();
+		} else {
+			target->key_column = ReadSingleColumn(tables->GetValue(5, row), "element key");
+		}
 		LoadLabel(connection, *target);
 		LoadProperties(connection, *target);
 		LoadPropertyIndexes(connection, *target);
@@ -883,14 +929,15 @@ bool GqlTryLoadTableGraph(ClientContext &context, const string &graph_name, GqlT
 			throw InvalidInputException("Table-backed graph '%s' has invalid endpoint table metadata", graph_name);
 		}
 	}
-	if (vertex_tables.size() == 1 && edge_tables.size() == 1) {
+	const bool referenced = vertex_tables[0].table.ownership == "REFERENCED";
+	if (!referenced && vertex_tables.size() == 1 && edge_tables.size() == 1) {
 		result.vertex = std::move(vertex_tables[0].table);
 		result.edge = std::move(edge_tables[0].table);
 		result.edge_source_column = edge_tables[0].source_column;
 		result.edge_target_column = edge_tables[0].target_column;
 	} else {
-		result.vertex = BuildReferencedUnion(connection, result.graph_id, "VERTEX", vertex_tables);
-		result.edge = BuildReferencedUnion(connection, result.graph_id, "EDGE", edge_tables);
+		result.vertex = BuildReferencedUnion(connection, result.graph_id, "VERTEX", vertex_tables, vertex_tables);
+		result.edge = BuildReferencedUnion(connection, result.graph_id, "EDGE", edge_tables, vertex_tables);
 		result.edge_source_column = "__gql_source_id";
 		result.edge_target_column = "__gql_target_id";
 	}

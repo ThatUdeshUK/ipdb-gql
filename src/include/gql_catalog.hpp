@@ -21,8 +21,10 @@ struct GqlElementTableBinding {
 	vector<string> static_labels;
 	unordered_map<string, string> property_columns;
 	unordered_map<string, string> property_indexes;
-	//! Non-empty for a heterogeneous referenced graph. This SELECT is a
-	//! canonical, zero-copy union over the physical element tables.
+	//! Non-empty for a referenced graph. This SELECT is a canonical, zero-copy
+	//! union over the physical element tables. Referenced source keys are
+	//! type-qualified by their mapping; the relation assigns snapshot-local,
+	//! graph-wide dense IDs used by MATCH, element_id(), and CSR.
 	string relation_sql;
 };
 
