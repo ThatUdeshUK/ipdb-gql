@@ -3,6 +3,7 @@
 # Extension from this repo
 duckdb_extension_load(duckgql
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
+    EXTENSION_VERSION 0.2.0
 )
 
 # Any extra extensions that should be built
