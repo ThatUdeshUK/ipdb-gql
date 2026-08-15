@@ -20,7 +20,8 @@ storage and execution engine, plus an explicit CSR layer for graph algorithms.
 
 - Managed property graphs backed by typed DuckDB vertex and edge tables.
 - Read-only, zero-copy typed graph projections over existing DuckDB and
-  DuckLake tables, with live DuckLake snapshot-aware CSR invalidation.
+  DuckLake tables, with live or pinned snapshots and snapshot-aware CSR
+  invalidation.
 - Graph-header CSV, compressed CSV, and Parquet bulk import.
 - Directed `MATCH`, `OPTIONAL MATCH`, filtering, projection, aggregation,
   ordering, paging, fixed multi-hop paths, and a bounded variable-length path
@@ -295,11 +296,12 @@ uses these database-scoped statistics to compare a correlated CSR frontier
 with a bulk edge-table scan and to avoid treating a highly skewed one-row
 endpoint as uniformly selective.
 
-## Query DuckLake tables as a graph (preview)
+## Query DuckLake tables as a graph
 
 DuckGQL lets you run GQL queries and graph algorithms directly over selected
 columns in existing DuckLake tables. Your data stays in DuckLake, and you
-choose which columns become graph IDs and properties.
+choose which columns become source keys and properties. DuckGQL assigns the
+dense, snapshot-local element IDs used for graph execution.
 
 ```sql
 INSTALL ducklake;
@@ -331,7 +333,6 @@ FROM TABLES (
         ),
     EDGE TABLE lake.main.orders
         MAP TO EDGE TYPE BOUGHT
-        KEY (order_id)
         SOURCE (customer_id) REFERENCES NODE TYPE Customer
         DESTINATION (product_id) REFERENCES NODE TYPE ProductNode
         PROPERTIES (
@@ -357,12 +358,14 @@ ORDER BY rank DESC;
 ```
 
 Only mapped columns are visible through GQL. Each vertex table maps one node
-type; edge endpoints resolve through the named node-type mappings. Source keys
-remain the values returned by `element_id`, so vertex keys must be unique across
-all mapped vertex tables (and edge keys across all mapped edge tables). With
-`SNAPSHOT_POLICY 'LIVE'`, queries see the current DuckLake snapshot, including
-newly committed data. Graph algorithms refresh automatically when that snapshot
-changes.
+type; edge endpoints resolve through the named node-type mappings. Vertex source
+keys need only be unique within their physical node mapping. Edge mappings may
+omit `KEY`, as above, or supply a key that is unique within that edge mapping.
+`element_id()` returns DuckGQL's generated snapshot-local identity, not the
+source key, so applications should persist mapped source-ID properties instead.
+With `SNAPSHOT_POLICY 'LIVE'`, queries see the current DuckLake snapshot,
+including newly committed data. Graph algorithms refresh automatically when
+that snapshot changes.
 
 For reproducible analysis, attach DuckLake at a specific version and register
 the graph with a pinned policy:
@@ -461,8 +464,8 @@ python3 scripts/benchmark/benchmark_snb_gql_interactive.py \
 ```
 
 For owned graphs, DuckLake tables can still be exported to graph-header Parquet
-and loaded with `COPY GRAPH`. The preview referenced-table mode above is the
-zero-copy, read-only alternative.
+and loaded with `COPY GRAPH`. The referenced-table mode above is the zero-copy,
+read-only alternative.
 
 ## Current limitations
 
@@ -482,9 +485,10 @@ zero-copy, read-only alternative.
   semantics, named graph types, typed storage enforcement, and the complete
   GQL value/type system remain incomplete.
 - Referenced graphs support heterogeneous vertex and edge table mappings,
-  graph-wide integer identity, static types, live or pinned snapshots, and
-  read-only access. Composite/string identities, multi-table joins for one node
-  record, mapping predicates, and write-through mutations are not yet supported.
+  mapping-scoped integer source keys, generated snapshot-local element IDs,
+  static types, live or pinned snapshots, and read-only access. Composite/string
+  identities, multi-table joins for one node record, mapping predicates, and
+  write-through mutations are not yet supported.
 
 The machine-readable status is
 [`test/conformance/iso-gql-2024.tsv`](test/conformance/iso-gql-2024.tsv). The
