@@ -1,0 +1,157 @@
+# name: test/sql/gql_distinct_projected_fetch.test
+# description: Safe early endpoint DISTINCT and explicit property-fetch projection
+# group: [gql]
+
+require duckgql
+
+statement ok
+COPY (
+    SELECT i AS ":ID", i AS "id:int", 'node-' || i AS "name:string",
+           repeat('unused', 200) AS "unused:string",
+           CASE WHEN i = 1 THEN 'Anchor' WHEN i <= 102 THEN 'Node' ELSE 'Leaf' END AS ":LABEL"
+    FROM range(1, 1103) t(i)
+) TO '__TEST_DIR__/distinct_fetch_nodes.csv' (HEADER)
+
+statement ok
+COPY (
+    SELECT 1 AS ":START_ID", i AS ":END_ID", 'R' AS ":TYPE" FROM range(2, 102) t(i)
+    UNION ALL SELECT i, 102, 'R' FROM range(2, 102) t(i)
+    UNION ALL SELECT 102, i, 'S' FROM range(103, 1103) t(i)
+) TO '__TEST_DIR__/distinct_fetch_edges.csv' (HEADER)
+
+statement ok
+CREATE GRAPH distinct_fetch ANY
+
+statement ok
+COPY GRAPH distinct_fetch FROM (VERTICES '__TEST_DIR__/distinct_fetch_nodes.csv', EDGES '__TEST_DIR__/distinct_fetch_edges.csv') FORMAT GRAPH
+
+statement ok
+CALL gql_create_property_index('distinct_fetch', 'id')
+
+statement ok
+CALL gql_build_csr('distinct_fetch')
+
+statement ok
+SESSION SET GRAPH distinct_fetch
+
+statement ok
+PRAGMA enable_profiling='json'
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/distinct_fetch.json'
+
+# One hundred different trails reach the same vertex, which has 1,000 leaves.
+# Endpoint DISTINCT must precede the leaf expansion and preserve ORDER/LIMIT.
+query I
+MATCH (a:Anchor) WHERE a.id = 1
+MATCH (a)-[:R]->{1,2}(b:Node), (b)-[:S]->(leaf:Leaf)
+RETURN DISTINCT leaf.id ORDER BY leaf.id LIMIT 5
+----
+103
+104
+105
+106
+107
+
+statement ok
+PRAGMA disable_profiling
+
+query I
+SELECT CAST(regexp_extract(content, '"cumulative_cardinality"\s*:\s*([0-9]+)', 1) AS BIGINT) < 20000
+FROM read_text('__TEST_DIR__/distinct_fetch.json')
+----
+true
+
+# DISTINCT on aggregate results cannot discard the paths counted by COUNT.
+query I
+MATCH (a:Anchor) WHERE a.id = 1
+MATCH (a)-[:R]->{1,2}(b:Node), (b)-[:S]->(leaf:Leaf)
+RETURN DISTINCT count(*)
+----
+100000
+
+query I
+MATCH (a:Anchor) WHERE a.id = 1
+MATCH (a)-[:R]->{1,2}(b:Node), (b)-[:S]->(leaf:Leaf)
+RETURN count(*)
+----
+100000
+
+# Each source's identity must remain part of the deduplication key.
+query II
+MATCH (a:Node)-[:R]->+(b:Node), (b)-[:S]->(leaf:Leaf)
+WHERE a.id = 2 OR a.id = 3
+RETURN DISTINCT a.id, leaf.id ORDER BY a.id, leaf.id LIMIT 3
+----
+2	103
+2	104
+2	105
+
+# The schema contract requests only these columns, in physical-table order.
+query IT rowsort
+SELECT fetched.id, fetched.name
+FROM (VALUES (2::UBIGINT), (1::UBIGINT), (2::UBIGINT), (NULL::UBIGINT)) seed(id),
+LATERAL gql_vertex_fetch_projected(struct_pack(vertex_id := seed.id,
+    columns := struct_pack(name := NULL, id := NULL))) fetched
+----
+1	node-1
+2	node-2
+2	node-2
+
+# A null parent struct cannot expose a stale/non-null ID child.
+query I
+SELECT count(*) FROM gql_vertex_fetch_projected(
+    NULL::STRUCT(vertex_id UBIGINT, columns STRUCT(id INTEGER)))
+----
+0
+
+query IT
+SELECT * FROM gql_vertex_fetch_projected(struct_pack(vertex_id := 1::UBIGINT,
+    columns := struct_pack(id := NULL, name := NULL)))
+----
+1	node-1
+
+statement error
+SELECT * FROM gql_vertex_fetch_projected(struct_pack(vertex_id := 1::UBIGINT,
+    columns := struct_pack(missing_column := NULL)))
+----
+Unknown projected vertex column 'missing_column'
+
+# A wide property is still fetched when the result actually requests it.
+query I
+MATCH (a:Anchor) WHERE a.id = 1
+MATCH (a)-[:R]->(b:Node)
+RETURN char_length(b.unused) ORDER BY b.id LIMIT 1
+----
+1200
+
+# Verify the generated lookup schema omits an unrequested wide property.
+statement ok
+PRAGMA enable_profiling='json'
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/projected_columns.json'
+
+query I
+MATCH (a:Anchor) WHERE a.id = 1
+MATCH (a)-[:R]->(b:Node)
+RETURN b.id ORDER BY b.id LIMIT 1
+----
+2
+
+statement ok
+PRAGMA disable_profiling
+
+query III
+SELECT contains(content, 'gql_vertex_fetch_projected'),
+       contains(regexp_extract(content, 'struct_pack\(vertex_id, \{[^}]*\}', 0), '''id'': NULL'),
+       contains(regexp_extract(content, 'struct_pack\(vertex_id, \{[^}]*\}', 0), 'unused')
+FROM read_text('__TEST_DIR__/projected_columns.json')
+----
+true	true	false
+
+# Full graph values still need every property, including the wide one.
+statement ok
+MATCH (a:Anchor) WHERE a.id = 1
+MATCH (a)-[:R]->(b:Node)
+RETURN b ORDER BY b.id LIMIT 1

@@ -1064,7 +1064,43 @@ static unique_ptr<SQLStatement> LowerInsertEdge(const string &snapshot_name, idx
 	return std::move(statement);
 }
 
-vector<unique_ptr<SQLStatement>> GqlLowerInsert(const GqlInsertStatement &insert) {
+vector<unique_ptr<SQLStatement>> GqlLowerInsert(const GqlInsertStatement &input) {
+	// Named nodes share one allocation across all paths in the graph pattern.
+	// Validate declarations before generating any DML.
+	GqlInsertStatement insert(input.source);
+	unordered_map<string, idx_t> node_variables;
+	unordered_set<string> edge_variables;
+	vector<idx_t> vertex_indices;
+	for (const auto &vertex : input.vertices) {
+		auto existing = node_variables.find(vertex.variable.value);
+		if (!vertex.variable.IsEmpty() && existing != node_variables.end()) {
+			if (!vertex.labels.empty() || !vertex.properties.empty()) {
+				throw BinderException("GQL INSERT node variable '%s' is already defined", vertex.variable.value);
+			}
+			vertex_indices.push_back(existing->second);
+			continue;
+		}
+		vertex_indices.push_back(insert.vertices.size());
+		if (!vertex.variable.IsEmpty()) {
+			node_variables.emplace(vertex.variable.value, insert.vertices.size());
+		}
+		insert.vertices.push_back(vertex);
+	}
+	for (auto edge : input.edges) {
+		if (!edge.variable.IsEmpty() &&
+		    (node_variables.count(edge.variable.value) || !edge_variables.insert(edge.variable.value).second)) {
+			throw BinderException("GQL INSERT edge variable '%s' is already bound", edge.variable.value);
+		}
+		edge.source_vertex = vertex_indices.at(edge.source_vertex);
+		edge.target_vertex = vertex_indices.at(edge.target_vertex);
+		insert.edges.push_back(std::move(edge));
+	}
+	for (auto projection : input.return_projections) {
+		if (projection.element_type == GqlPatternElementType::VERTEX) {
+			projection.element_index = vertex_indices.at(projection.element_index);
+		}
+		insert.return_projections.push_back(std::move(projection));
+	}
 	if (insert.vertices.empty()) {
 		throw BinderException("GQL INSERT requires at least one vertex");
 	}

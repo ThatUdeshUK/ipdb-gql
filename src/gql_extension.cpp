@@ -84,6 +84,7 @@ static void RegisterAlgorithmFunctions(ExtensionLoader &loader) {
 	register_function(GqlBfsFunction());
 	register_function(GqlDfsFunction());
 	register_function(GqlSsspFunction());
+	register_function(GqlWeightedSsspFunction());
 	register_function(GqlPageRankFunction());
 	register_function(GqlWccFunction());
 	register_function(GqlSccFunction());
@@ -101,6 +102,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GqlCsrExpandFunction());
 	loader.RegisterFunction(GqlCsrPathExpandFunction());
 	loader.RegisterFunction(GqlVertexFetchFunction());
+	loader.RegisterFunction(GqlProjectedVertexFetchFunction());
 	loader.RegisterFunction(GqlEdgeFetchFunction());
 	loader.RegisterFunction(GqlBuildCsrFunction());
 	loader.RegisterFunction(GqlCsrStatsFunction());

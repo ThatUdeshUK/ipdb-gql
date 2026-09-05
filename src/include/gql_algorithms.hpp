@@ -38,6 +38,7 @@ TableFunction GqlAlgorithmStatsFunction();
 TableFunction GqlBfsFunction();
 TableFunction GqlDfsFunction();
 TableFunction GqlSsspFunction();
+TableFunction GqlWeightedSsspFunction();
 TableFunction GqlPageRankFunction();
 TableFunction GqlWccFunction();
 TableFunction GqlSccFunction();

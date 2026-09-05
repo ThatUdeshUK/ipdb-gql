@@ -1,0 +1,105 @@
+# name: test/sql/gql_vlp_execution.test
+# description: CSR trail membership, backtracking, duplicates, and output chunk boundaries
+# group: [gql]
+
+require duckgql
+
+statement ok
+COPY (SELECT i AS ":ID", 'Node' AS ":LABEL" FROM range(1, 4098) t(i))
+TO '__TEST_DIR__/vlp_chain_nodes.csv' (HEADER)
+
+statement ok
+COPY (SELECT i AS ":START_ID", i + 1 AS ":END_ID", 'route' AS ":TYPE" FROM range(1, 4097) t(i))
+TO '__TEST_DIR__/vlp_chain_edges.csv' (HEADER)
+
+statement ok
+CREATE GRAPH vlp_chain ANY
+
+statement ok
+COPY GRAPH vlp_chain FROM (VERTICES '__TEST_DIR__/vlp_chain_nodes.csv', EDGES '__TEST_DIR__/vlp_chain_edges.csv') FORMAT GRAPH
+
+statement ok
+CALL gql_build_csr('vlp_chain')
+
+# Multiple output chunks, exhausted input, repeated/null seeds, and reset of
+# the long-trail membership state between lateral inputs.
+query IIII
+SELECT count(*), sum(__gql_edge_id), sum(__gql_source_id), sum(__gql_target_id)
+FROM (VALUES (1::UBIGINT), (1::UBIGINT), (NULL::UBIGINT), (4097::UBIGINT)) seed(id),
+LATERAL gql_csr_path_expand(struct_pack(graph_name := 'vlp_chain', vertex_id := seed.id,
+direction := 'out', edge_label := 'route', minimum_repetitions := 1::UBIGINT,
+maximum_repetitions := 4096::UBIGINT, unbounded := false)) p
+----
+8192	16781312	8192	16789504
+
+query IIII
+SELECT count(*), sum(__gql_edge_id), sum(__gql_source_id), sum(__gql_target_id)
+FROM gql_csr_path_expand(struct_pack(graph_name := 'vlp_chain', vertex_id := 4097::UBIGINT,
+direction := 'in', edge_label := 'route', minimum_repetitions := 1::UBIGINT,
+maximum_repetitions := 0::UBIGINT, unbounded := true)) p
+----
+4096	8390656	8390656	16781312
+
+# A partial final chunk must terminate even for standalone (non-lateral) calls.
+query I
+SELECT count(*) FROM gql_csr_path_expand(struct_pack(graph_name := 'vlp_chain', vertex_id := 1::UBIGINT,
+direction := 'out', edge_label := 'route', minimum_repetitions := 1::UBIGINT,
+maximum_repetitions := 63::UBIGINT, unbounded := false)) p
+----
+63
+
+query IIIT
+SELECT * FROM gql_csr_path_expand(struct_pack(graph_name := 'vlp_chain', vertex_id := 4097::UBIGINT,
+direction := 'out', edge_label := 'route', minimum_repetitions := 0::UBIGINT,
+maximum_repetitions := 0::UBIGINT, unbounded := true)) p
+----
+0	4097	4097	route
+
+# A cycle after a long prefix, parallel edges, a self-loop, and another label.
+# Compare the complete multiset with a relational recursive trail enumerator.
+statement ok
+CREATE TABLE vlp_edges AS
+SELECT i AS id, i AS src, i + 1 AS dst, 'route' AS kind FROM range(1, 70) t(i)
+UNION ALL SELECT * FROM (VALUES (70, 70, 65, 'route'), (71, 65, 67, 'route'),
+(72, 65, 67, 'route'), (73, 66, 66, 'route'), (74, 1, 70, 'other')) e(id, src, dst, kind)
+
+statement ok
+COPY (SELECT i AS ":ID", 'Node' AS ":LABEL" FROM range(1, 72) t(i))
+TO '__TEST_DIR__/vlp_trail_nodes.csv' (HEADER)
+
+statement ok
+COPY (SELECT src AS ":START_ID", dst AS ":END_ID", kind AS ":TYPE" FROM vlp_edges ORDER BY id)
+TO '__TEST_DIR__/vlp_trail_edges.csv' (HEADER)
+
+statement ok
+CREATE GRAPH vlp_trails ANY
+
+statement ok
+COPY GRAPH vlp_trails FROM (VERTICES '__TEST_DIR__/vlp_trail_nodes.csv', EDGES '__TEST_DIR__/vlp_trail_edges.csv') FORMAT GRAPH
+
+statement ok
+CALL gql_build_csr('vlp_trails')
+
+query I
+WITH RECURSIVE expected(start_id, end_id, edges) AS (
+    SELECT id, id, []::BIGINT[] FROM (VALUES (1), (1), (65)) seed(id)
+    UNION ALL
+    SELECT p.start_id, e.dst, list_append(p.edges, e.id)
+    FROM expected p JOIN vlp_edges e ON p.end_id = e.src
+    WHERE e.kind = 'route' AND NOT list_contains(p.edges, e.id)
+), reference AS (
+    SELECT edges[-1] AS edge_id, start_id, end_id, 'route' AS kind
+    FROM expected WHERE len(edges) >= 1
+), actual AS (
+    SELECT p.* FROM (VALUES (1::UBIGINT), (1::UBIGINT), (65::UBIGINT)) seed(id),
+    LATERAL gql_csr_path_expand(struct_pack(graph_name := 'vlp_trails', vertex_id := seed.id,
+    direction := 'out', edge_label := 'route', minimum_repetitions := 1::UBIGINT,
+    maximum_repetitions := 0::UBIGINT, unbounded := true)) p
+)
+SELECT count(*) FROM (
+    (SELECT * FROM actual EXCEPT ALL SELECT * FROM reference)
+    UNION ALL
+    (SELECT * FROM reference EXCEPT ALL SELECT * FROM actual)
+) differences
+----
+0

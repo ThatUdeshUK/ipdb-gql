@@ -9,6 +9,12 @@ class Connection;
 
 string GqlTypedPropertyDuckType(const string &gql_type);
 
+struct GqlSourceTable {
+	string catalog_name;
+	string schema_name;
+	string table_name;
+};
+
 struct GqlElementTableBinding {
 	uint64_t element_table_id = 0;
 	string catalog_name;
@@ -26,6 +32,7 @@ struct GqlElementTableBinding {
 	//! type-qualified by their mapping; the relation assigns snapshot-local,
 	//! graph-wide dense IDs used by MATCH, element_id(), and CSR.
 	string relation_sql;
+	vector<GqlSourceTable> source_tables;
 };
 
 struct GqlTableGraphBinding {

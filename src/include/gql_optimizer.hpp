@@ -48,6 +48,10 @@ struct GqlAccessPathInput {
 	vector<GqlPatternElementType> binding_types;
 	vector<GqlExpressionProgram> projections;
 	vector<GqlExpressionProgram> predicates;
+	// The final result removes duplicates, with no multiplicity-sensitive or
+	// potentially volatile expressions between MATCH and that DISTINCT.
+	bool duplicate_insensitive = false;
+	vector<vector<string>> vertex_fetch_columns;
 };
 
 enum class GqlBindingAccessPathType : uint8_t {
@@ -68,9 +72,11 @@ struct GqlBindingAccessPath {
 	idx_t minimum_repetitions = 1;
 	idx_t maximum_repetitions = 1;
 	bool unbounded = false;
+	bool distinct_endpoints = false;
 	bool fetch_edge_properties = false;
 	idx_t fetch_id_binding = DConstants::INVALID_INDEX;
 	string fetch_id_column;
+	vector<string> fetch_columns;
 	string property_name;
 	string property_column;
 	string property_index_name;

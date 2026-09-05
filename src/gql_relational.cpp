@@ -917,6 +917,21 @@ static bool ContainsAggregate(const GqlExpressionProgram &program) {
 	return false;
 }
 
+static bool AllowsDuplicateElimination(const GqlExpressionProgram &program) {
+	if (ContainsAggregate(program)) {
+		return false;
+	}
+	for (idx_t node = 0; node < program.node_types.size(); node++) {
+		if (static_cast<GqlExpressionType>(program.node_types[node]) == GqlExpressionType::FUNCTION &&
+		    !StringUtil::CIEquals(program.values[node], "coalesce") &&
+		    !StringUtil::CIEquals(program.values[node], "element_id")) {
+			// Fail closed for functions without a proven deterministic contract.
+			return false;
+		}
+	}
+	return true;
+}
+
 static void AppendStructField(vector<unique_ptr<ParsedExpression>> &fields, unique_ptr<ParsedExpression> expression,
                               const string &name) {
 	expression->SetAlias(name);
@@ -940,13 +955,26 @@ static unique_ptr<TableRef> CsrExpansionTable(const string &graph_name, const st
 }
 
 static unique_ptr<TableRef> ElementFetchTable(const string &graph_name, const string &element_kind,
-                                              unique_ptr<ParsedExpression> element_id, const string &alias) {
+                                              unique_ptr<ParsedExpression> element_id, const string &alias,
+                                              const vector<string> &columns = {}) {
 	(void)graph_name;
 	vector<unique_ptr<ParsedExpression>> arguments;
-	arguments.push_back(std::move(element_id));
+	if (!columns.empty()) {
+		vector<unique_ptr<ParsedExpression>> schema;
+		for (const auto &column : columns) {
+			AppendStructField(schema, Constant(Value()), column);
+		}
+		vector<unique_ptr<ParsedExpression>> fields;
+		AppendStructField(fields, std::move(element_id), "vertex_id");
+		AppendStructField(fields, Function("struct_pack", std::move(schema)), "columns");
+		arguments.push_back(Function("struct_pack", std::move(fields)));
+	} else {
+		arguments.push_back(std::move(element_id));
+	}
 	auto result = make_uniq<TableFunctionRef>();
-	result->function = make_uniq<FunctionExpression>(element_kind == "vertex" ? "gql_vertex_fetch" : "gql_edge_fetch",
-	                                                 std::move(arguments));
+	result->function = make_uniq<FunctionExpression>(!columns.empty() ? "gql_vertex_fetch_projected" :
+	                                               element_kind == "vertex" ? "gql_vertex_fetch" : "gql_edge_fetch",
+	                                               std::move(arguments));
 	result->alias = alias;
 	return std::move(result);
 }
@@ -986,6 +1014,19 @@ static unique_ptr<TableRef> CsrPathExpansionTable(const string &graph_name, cons
 	auto result = make_uniq<TableFunctionRef>();
 	result->function = make_uniq<FunctionExpression>("gql_csr_path_expand", std::move(arguments));
 	result->alias = edge_alias;
+	if (path.distinct_endpoints) {
+		result->alias = edge_alias + "_trails";
+		auto select = make_uniq<SelectNode>();
+		select->select_list.push_back(Aliased(Constant(Value::UBIGINT(0)), "__gql_edge_id"));
+		for (const auto &column : {"__gql_source_id", "__gql_target_id", "__gql_type"}) {
+			select->select_list.push_back(Aliased(Column(result->alias, column), column));
+		}
+		select->modifiers.push_back(make_uniq<DistinctModifier>());
+		select->from_table = std::move(result);
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(select);
+		return make_uniq<SubqueryRef>(std::move(statement), edge_alias);
+	}
 	return std::move(result);
 }
 
@@ -1593,10 +1634,17 @@ static unique_ptr<TableRef> RecursiveMatchBindReplace(ClientContext &context, Ta
 static unique_ptr<TableRef> TableBackedMatch(ClientContext &context, const string &graph_name,
                                              const GqlTableGraphBinding &graph, const RelationalMatchInput &match) {
 	vector<RelationalIdentityAccess> identities(match.binding_types.size());
+	vector<vector<string>> vertex_fetch_columns(match.binding_types.size());
 	for (idx_t index = 0; index < match.binding_types.size(); index++) {
 		const auto &table = match.binding_types[index] == GqlPatternElementType::EDGE ? graph.edge : graph.vertex;
 		auto alias = "gql_object_" + to_string(index);
 		identities[index] = {alias, table.key_column};
+		if (match.binding_types[index] == GqlPatternElementType::VERTEX) {
+			vertex_fetch_columns[index].push_back(table.key_column);
+			if (!table.label_column.empty()) {
+				vertex_fetch_columns[index].push_back(table.label_column);
+			}
+		}
 	}
 
 	RelationalPropertyMap property_aliases;
@@ -1626,6 +1674,36 @@ static unique_ptr<TableRef> TableBackedMatch(ClientContext &context, const strin
 		} else {
 			FindPropertyColumn(table, property, entry.second.column_name);
 		}
+		if (match.binding_types[binding_index] == GqlPatternElementType::VERTEX && !entry.second.column_name.empty()) {
+			vertex_fetch_columns[binding_index].push_back(entry.second.column_name);
+		}
+	}
+	for (const auto &programs : {&match.projections, &match.predicates}) {
+		for (const auto &program : *programs) {
+			for (idx_t node = 0; node < program.node_types.size(); node++) {
+				// Property/identity/label receivers name an element, but do not
+				// materialize its complete value. Their columns were collected above.
+				if (node > 0) {
+					auto previous = static_cast<GqlExpressionType>(program.node_types[node - 1]);
+					if (previous == GqlExpressionType::PROPERTY_REFERENCE || previous == GqlExpressionType::ELEMENT_ID ||
+					    previous == GqlExpressionType::LABELED) {
+						continue;
+					}
+				}
+				auto binding = program.binding_indices[node];
+				if (binding < match.binding_types.size() &&
+				    match.binding_types[binding] == GqlPatternElementType::VERTEX &&
+				    static_cast<GqlTypeId>(program.result_types[node]) == GqlTypeId::NODE) {
+					for (const auto &property : graph.vertex.property_columns) {
+						vertex_fetch_columns[binding].push_back(property.second);
+					}
+				}
+			}
+		}
+	}
+	for (auto &columns : vertex_fetch_columns) {
+		std::sort(columns.begin(), columns.end());
+		columns.erase(std::unique(columns.begin(), columns.end()), columns.end());
 	}
 
 	GqlAccessPathInput access_input;
@@ -1633,6 +1711,14 @@ static unique_ptr<TableRef> TableBackedMatch(ClientContext &context, const strin
 	access_input.binding_types = match.binding_types;
 	access_input.projections = match.projections;
 	access_input.predicates = match.predicates;
+	access_input.vertex_fetch_columns = std::move(vertex_fetch_columns);
+	access_input.duplicate_insensitive = match.modifiers.distinct;
+	for (const auto &program : match.projections) {
+		access_input.duplicate_insensitive &= AllowsDuplicateElimination(program);
+	}
+	for (const auto &program : match.predicates) {
+		access_input.duplicate_insensitive &= AllowsDuplicateElimination(program);
+	}
 	for (const auto &stage : match.match_stages) {
 		GqlAccessMatchStage access_stage;
 		for (const auto &pattern : stage.patterns) {
@@ -1667,6 +1753,44 @@ static unique_ptr<TableRef> TableBackedMatch(ClientContext &context, const strin
 		}
 		const auto &stage_plan = access_plan.stages[stage_index];
 		result.introduced = stage_plan.introduced;
+		vector<bool> joined(match.binding_types.size(), false);
+		const bool correlated_stage = std::find(available.begin(), available.end(), true) != available.end();
+		vector<unique_ptr<TableRef>> components(match.binding_types.size());
+		vector<idx_t> component_ids(match.binding_types.size(), DConstants::INVALID_INDEX);
+		struct EndpointJoin {
+			idx_t edge;
+			idx_t vertex;
+			string column;
+		};
+		vector<EndpointJoin> endpoint_joins;
+		for (const auto &pattern : stage.patterns) {
+			for (idx_t index = 1; index < pattern.elements.size(); index += 2) {
+				const auto &edge = pattern.elements[index];
+				endpoint_joins.push_back({edge.binding_index, pattern.elements[index - 1].binding_index,
+				                         edge.reverse ? graph.edge_target_column : graph.edge_source_column});
+				endpoint_joins.push_back({edge.binding_index, pattern.elements[index + 1].binding_index,
+				                         edge.reverse ? graph.edge_source_column : graph.edge_target_column});
+			}
+		}
+		auto merge_components = [&](idx_t left, idx_t right) {
+			vector<unique_ptr<ParsedExpression>> conditions;
+			for (const auto &endpoint : endpoint_joins) {
+				if ((component_ids[endpoint.edge] == left && component_ids[endpoint.vertex] == right) ||
+				    (component_ids[endpoint.edge] == right && component_ids[endpoint.vertex] == left)) {
+					conditions.push_back(Equal(Column(identities[endpoint.edge].table_alias, endpoint.column),
+					                           Column(identities[endpoint.vertex].table_alias, graph.vertex.key_column)));
+				}
+			}
+			if (conditions.empty()) {
+				conditions.push_back(Constant(Value(true)));
+			}
+			AppendJoin(components[left], std::move(components[right]), JoinType::INNER, std::move(conditions));
+			for (auto &component : component_ids) {
+				if (component == right) {
+					component = left;
+				}
+			}
+		};
 		for (const auto binding_index : stage_plan.source_order) {
 			unique_ptr<TableRef> source;
 			const auto &path = stage_plan.bindings[binding_index];
@@ -1694,18 +1818,56 @@ static unique_ptr<TableRef> TableBackedMatch(ClientContext &context, const strin
 				}
 				source = ElementFetchTable(graph_name, "vertex",
 				                           Column(identities[path.fetch_id_binding].table_alias, path.fetch_id_column),
-				                           identities[binding_index].table_alias);
+				                           identities[binding_index].table_alias, path.fetch_columns);
+
 			} else {
 				const auto &table =
 				    match.binding_types[binding_index] == GqlPatternElementType::EDGE ? graph.edge : graph.vertex;
 				source = ElementTable(table, identities[binding_index].table_alias);
 			}
+			components[binding_index] = std::move(source);
+			component_ids[binding_index] = binding_index;
+			joined[binding_index] = true;
+			// Preserve the established lateral nesting for stages that capture
+			// outer bindings (including OPTIONAL MATCH). Splitting those trees
+			// requires representing their external dependencies explicitly.
+			if (correlated_stage && binding_index != stage_plan.source_order.front()) {
+				merge_components(component_ids[stage_plan.source_order.front()], binding_index);
+			}
+			// A lateral source must stay with its seed, but independent indexed
+			// branches should not be multiplied together before they meet at a
+			// graph endpoint. Build separate join trees until a connector exists.
+			idx_t dependency = DConstants::INVALID_INDEX;
+			if (path.type == GqlBindingAccessPathType::CSR_EXPANSION ||
+			    path.type == GqlBindingAccessPathType::CSR_EDGE_PROPERTY_EXPANSION ||
+			    path.type == GqlBindingAccessPathType::CSR_PATH_EXPANSION ||
+			    path.type == GqlBindingAccessPathType::RELATIONAL_PATH_EXPANSION) {
+				dependency = path.expansion_vertex_binding;
+			} else if (path.type == GqlBindingAccessPathType::BATCHED_ELEMENT_FETCH) {
+				dependency = path.fetch_id_binding;
+			}
+			if (dependency != DConstants::INVALID_INDEX && joined[dependency] &&
+			    component_ids[dependency] != component_ids[binding_index]) {
+				merge_components(component_ids[dependency], component_ids[binding_index]);
+			}
+			for (const auto &endpoint : endpoint_joins) {
+				if (joined[endpoint.edge] && joined[endpoint.vertex] &&
+				    component_ids[endpoint.edge] != component_ids[endpoint.vertex]) {
+					merge_components(component_ids[endpoint.vertex], component_ids[endpoint.edge]);
+				}
+			}
+		}
+		// Truly disconnected patterns retain their Cartesian-product semantics.
+		for (auto &component : components) {
+			if (!component) {
+				continue;
+			}
 			if (!result.source) {
-				result.source = std::move(source);
+				result.source = std::move(component);
 			} else {
-				vector<unique_ptr<ParsedExpression>> cross_conditions;
-				cross_conditions.push_back(Constant(Value(true)));
-				AppendJoin(result.source, std::move(source), JoinType::INNER, std::move(cross_conditions));
+				vector<unique_ptr<ParsedExpression>> conditions;
+				conditions.push_back(Constant(Value(true)));
+				AppendJoin(result.source, std::move(component), JoinType::INNER, std::move(conditions));
 			}
 		}
 		idx_t posting_index = 0;
@@ -1746,12 +1908,16 @@ static unique_ptr<TableRef> TableBackedMatch(ClientContext &context, const strin
 				const auto &edge = pattern.elements[element_index];
 				const auto &right = pattern.elements[element_index + 1];
 				auto edge_alias = identities[edge.binding_index].table_alias;
-				result.conditions.push_back(
-				    Equal(Column(edge_alias, edge.reverse ? graph.edge_target_column : graph.edge_source_column),
-				          Column(identities[left.binding_index].table_alias, graph.vertex.key_column)));
-				result.conditions.push_back(
-				    Equal(Column(edge_alias, edge.reverse ? graph.edge_source_column : graph.edge_target_column),
-				          Column(identities[right.binding_index].table_alias, graph.vertex.key_column)));
+				if (!joined[edge.binding_index] || !joined[left.binding_index]) {
+					result.conditions.push_back(
+					    Equal(Column(edge_alias, edge.reverse ? graph.edge_target_column : graph.edge_source_column),
+					          Column(identities[left.binding_index].table_alias, graph.vertex.key_column)));
+				}
+				if (!joined[edge.binding_index] || !joined[right.binding_index]) {
+					result.conditions.push_back(
+					    Equal(Column(edge_alias, edge.reverse ? graph.edge_source_column : graph.edge_target_column),
+					          Column(identities[right.binding_index].table_alias, graph.vertex.key_column)));
+				}
 			}
 			// TRAIL uniqueness belongs to one path pattern. Independent
 			// comma-separated patterns and later MATCH stages may legally reuse an

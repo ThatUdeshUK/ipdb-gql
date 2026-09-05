@@ -70,6 +70,20 @@ static const vector<GqlProcedureDefinition> &AlgorithmProcedures() {
 	      {"edge_id", {GqlTypeId::ELEMENT_ID, true}},
 	      {"settled_order", {GqlTypeId::INTEGER, false}}}},
 	    {"algo",
+	     "weighted_sssp",
+	     GqlProcedureInputMode::BATCH,
+	     {{"graph", {GqlTypeId::STRING, false}, GqlProcedureArgumentMode::CONFIGURATION},
+	      {"source", {GqlTypeId::ELEMENT_ID, false}, GqlProcedureArgumentMode::INPUT},
+	      {"weight_property", {GqlTypeId::STRING, false}, GqlProcedureArgumentMode::CONFIGURATION},
+	      {"vertex_label", {GqlTypeId::STRING, false}, GqlProcedureArgumentMode::CONFIGURATION, true},
+	      {"edge_label", {GqlTypeId::STRING, false}, GqlProcedureArgumentMode::CONFIGURATION, true},
+	      {"target_vertex_id", {GqlTypeId::INTEGER, false}, GqlProcedureArgumentMode::CONFIGURATION, true}},
+	     {{"vertex_id", {GqlTypeId::ELEMENT_ID, false}},
+	      {"distance", {GqlTypeId::DOUBLE, false}},
+	      {"parent_vertex_id", {GqlTypeId::ELEMENT_ID, true}},
+	      {"edge_id", {GqlTypeId::ELEMENT_ID, true}},
+	      {"settled_order", {GqlTypeId::INTEGER, false}}}},
+	    {"algo",
 	     "shortest_path_length",
 	     GqlProcedureInputMode::BATCH,
 	     {{"graph", {GqlTypeId::STRING, false}, GqlProcedureArgumentMode::CONFIGURATION},
@@ -271,8 +285,8 @@ struct TraversalBindData : TableFunctionData {
 	uint64_t target_vertex_id = 0;
 };
 
-static unique_ptr<FunctionData> TraversalBind(ClientContext &, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+static unique_ptr<FunctionData> ReadTraversalBind(TableFunctionBindInput &input, vector<LogicalType> &return_types,
+                                                  vector<string> &names, idx_t vertex_label_position) {
 	if ((input.inputs.size() != 2 && input.inputs.size() != 3) || input.inputs[0].IsNull() ||
 	    input.inputs[1].IsNull()) {
 		throw BinderException("GQL CSR traversal requires a graph name and start vertex ID");
@@ -295,7 +309,7 @@ static unique_ptr<FunctionData> TraversalBind(ClientContext &, TableFunctionBind
 		}
 	}
 	result->edge_label = ReadLabelParameter(input, "edge_label");
-	result->vertex_label = ReadVertexLabel(input, 2);
+	result->vertex_label = ReadVertexLabel(input, vertex_label_position);
 	if (auto value = NamedParameter(input, "target_vertex_id")) {
 		if (!value->IsNull()) {
 			auto target_vertex_id = value->GetValue<int64_t>();
@@ -313,6 +327,11 @@ static unique_ptr<FunctionData> TraversalBind(ClientContext &, TableFunctionBind
 	return_types = {LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 	                LogicalType::UBIGINT};
 	return std::move(result);
+}
+
+static unique_ptr<FunctionData> TraversalBind(ClientContext &, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	return ReadTraversalBind(input, return_types, names, 2);
 }
 
 static unique_ptr<FunctionData> SsspBind(ClientContext &context, TableFunctionBindInput &input,
@@ -449,6 +468,200 @@ struct TraversalOutputWriter {
 	uint64_t *edge_ids;
 	uint64_t *visit_orders;
 };
+
+struct WeightedSsspBindData : TraversalBindData {
+	string weight_property;
+};
+
+static unique_ptr<FunctionData> WeightedSsspBind(ClientContext &, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs.size() != 3 || input.inputs[2].IsNull() || input.inputs[2].GetValue<string>().empty()) {
+		throw BinderException("GQL weighted SSSP requires a non-empty edge weight property");
+	}
+	// The third positional argument is the weight property, not a vertex label.
+	auto weight_property = input.inputs.back().GetValue<string>();
+	auto traversal = ReadTraversalBind(input, return_types, names, 3);
+	auto result = make_uniq<WeightedSsspBindData>();
+	static_cast<TraversalBindData &>(*result) = traversal->Cast<TraversalBindData>();
+	result->weight_property = StringUtil::Lower(weight_property);
+	names = {"vertex_id", "distance", "parent_vertex_id", "edge_id", "settled_order"};
+	return_types[1] = LogicalType::DOUBLE;
+	return std::move(result);
+}
+
+struct WeightedSsspState : GlobalTableFunctionState {
+	bool initialized = false;
+	bool finished = false;
+	shared_ptr<const GqlCsrSnapshot> snapshot;
+	vector<uint8_t> vertex_mask;
+	vector<uint8_t> settled;
+	vector<double> distances;
+	vector<idx_t> parents;
+	vector<uint64_t> parent_edges;
+	// An indexed binary heap keeps traversal working memory O(V), even for
+	// graphs with many parallel edges or repeated distance improvements.
+	vector<idx_t> heap;
+	vector<idx_t> positions;
+	idx_t start = 0;
+	idx_t target = 0;
+	idx_t settled_order = 0;
+	bool filter_label = false;
+	uint32_t required_label = 0;
+
+	bool Less(idx_t left, idx_t right) const {
+		return distances[left] < distances[right] || (distances[left] == distances[right] && left < right);
+	}
+	void Swap(idx_t left, idx_t right) {
+		std::swap(heap[left], heap[right]);
+		positions[heap[left]] = left;
+		positions[heap[right]] = right;
+	}
+	void Decrease(idx_t vertex) {
+		if (positions[vertex] == DConstants::INVALID_INDEX) {
+			positions[vertex] = heap.size();
+			heap.push_back(vertex);
+		}
+		auto position = positions[vertex];
+		while (position > 0 && Less(heap[position], heap[(position - 1) / 2])) {
+			auto parent = (position - 1) / 2;
+			Swap(position, parent);
+			position = parent;
+		}
+	}
+	idx_t Pop() {
+		auto vertex = heap[0];
+		Swap(0, heap.size() - 1);
+		heap.pop_back();
+		positions[vertex] = DConstants::INVALID_INDEX;
+		idx_t position = 0;
+		while (position * 2 + 1 < heap.size()) {
+			auto child = position * 2 + 1;
+			if (child + 1 < heap.size() && Less(heap[child + 1], heap[child])) {
+				child++;
+			}
+			if (!Less(heap[child], heap[position])) {
+				break;
+			}
+			Swap(position, child);
+			position = child;
+		}
+		return vertex;
+	}
+};
+
+static unique_ptr<GlobalTableFunctionState> WeightedSsspInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<WeightedSsspState>();
+}
+
+template <class VISITOR>
+static void VisitWeightedNeighbors(const WeightedSsspBindData &data, const WeightedSsspState &state, idx_t vertex,
+                                   VISITOR &&visitor) {
+	auto &snapshot = *state.snapshot;
+	auto visit = [&](const vector<uint64_t> &offsets, const GqlCsrOrdinals &neighbors, const vector<uint64_t> &edge_ids,
+	                 const GqlCsrEdgeLabels &labels, const vector<double> &weights) {
+		for (idx_t edge = offsets[vertex]; edge < offsets[vertex + 1]; edge++) {
+			auto neighbor = neighbors[edge];
+			if (!InVertexProjection(state.vertex_mask, neighbor) ||
+			    (state.filter_label && labels[edge] != state.required_label)) {
+				continue;
+			}
+			visitor(neighbor, edge_ids[edge], weights[edge]);
+		}
+	};
+	if (data.direction != CsrDirection::IN) {
+		visit(snapshot.outgoing_offsets, snapshot.outgoing_neighbors, snapshot.outgoing_edge_ids,
+		      snapshot.outgoing_label_ids, snapshot.outgoing_weights);
+	}
+	if (data.direction != CsrDirection::OUT) {
+		visit(snapshot.incoming_offsets, snapshot.incoming_neighbors, snapshot.incoming_edge_ids,
+		      snapshot.incoming_label_ids, snapshot.incoming_weights);
+	}
+}
+
+static void InitializeWeightedSssp(ClientContext &context, const WeightedSsspBindData &data, WeightedSsspState &state) {
+	state.snapshot = GqlGetOrBuildCsrSnapshot(
+	    context, data.graph_name, AlgorithmCsrCapabilities(data.direction, data.edge_label, data.vertex_label, true),
+	    nullptr, data.weight_property);
+	idx_t projected_count;
+	state.vertex_mask = BuildVertexMask(*state.snapshot, data.vertex_label, projected_count);
+	state.start = RequireProjectedVertex(*state.snapshot, state.vertex_mask, data.start_vertex_id, "start");
+	if (data.has_target) {
+		state.target = RequireProjectedVertex(*state.snapshot, state.vertex_mask, data.target_vertex_id, "target");
+	}
+	state.required_label = ResolveLabel(*state.snapshot, data.edge_label, state.filter_label);
+	auto count = state.snapshot->vertex_ids.size();
+	// Validate the entire selected projection before emitting any row, including
+	// unreachable edges and calls that stop immediately at their target.
+	for (idx_t vertex = 0; vertex < count; vertex++) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		if (InVertexProjection(state.vertex_mask, vertex)) {
+			VisitWeightedNeighbors(data, state, vertex, [&](idx_t, uint64_t edge, double weight) {
+				if (!std::isfinite(weight) || weight < 0) {
+					throw InvalidInputException("GQL weighted SSSP requires finite, non-negative, non-NULL weights; "
+					                            "invalid property '%s' on edge %llu",
+					                            data.weight_property, edge);
+				}
+			});
+		}
+	}
+	state.distances.assign(count, std::numeric_limits<double>::infinity());
+	state.parents.assign(count, DConstants::INVALID_INDEX);
+	state.parent_edges.resize(count);
+	state.positions.assign(count, DConstants::INVALID_INDEX);
+	state.settled.assign(count, false);
+	state.distances[state.start] = 0;
+	state.Decrease(state.start);
+	state.initialized = true;
+}
+
+static void WeightedSsspFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &data = input.bind_data->Cast<WeightedSsspBindData>();
+	auto &state = input.global_state->Cast<WeightedSsspState>();
+	if (!state.initialized) {
+		InitializeWeightedSssp(context, data, state);
+	}
+	idx_t count = 0;
+	while (count < STANDARD_VECTOR_SIZE && !state.heap.empty() && !state.finished) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto vertex = state.Pop();
+		state.settled[vertex] = true;
+		output.SetValue(0, count, Value::UBIGINT(state.snapshot->vertex_ids[vertex]));
+		output.SetValue(1, count, Value::DOUBLE(state.distances[vertex]));
+		output.SetValue(2, count,
+		                state.parents[vertex] == DConstants::INVALID_INDEX
+		                    ? Value(LogicalType::UBIGINT)
+		                    : Value::UBIGINT(state.snapshot->vertex_ids[state.parents[vertex]]));
+		output.SetValue(3, count,
+		                state.parents[vertex] == DConstants::INVALID_INDEX
+		                    ? Value(LogicalType::UBIGINT)
+		                    : Value::UBIGINT(state.parent_edges[vertex]));
+		output.SetValue(4, count++, Value::UBIGINT(state.settled_order++));
+		if (data.has_target && vertex == state.target) {
+			state.finished = true;
+			break;
+		}
+		VisitWeightedNeighbors(data, state, vertex, [&](idx_t neighbor, uint64_t edge, double weight) {
+			if (state.settled[neighbor]) {
+				return;
+			}
+			auto distance = state.distances[vertex] + weight;
+			if (!std::isfinite(distance)) {
+				throw OutOfRangeException("GQL weighted SSSP distance overflow");
+			}
+			if (distance < state.distances[neighbor]) {
+				state.distances[neighbor] = distance;
+				state.parents[neighbor] = vertex;
+				state.parent_edges[neighbor] = edge;
+				state.Decrease(neighbor);
+			}
+		});
+	}
+	output.SetCardinality(count);
+}
 
 struct BfsState : GlobalTableFunctionState {
 	bool initialized = false;
@@ -2718,7 +2931,28 @@ static void InitializeAlgorithmCall(ExecutionContext &context, const AlgorithmCa
 	auto &name = data.definition->name;
 	auto graph_name = data.configuration[0].value;
 	auto vertex_label = data.configuration.size() > 1 ? data.configuration[1].value : string();
-	if (name == "bfs" || name == "sssp") {
+	if (name == "weighted_sssp") {
+		std::sort(state.frontier.begin(), state.frontier.end());
+		state.frontier.erase(std::unique(state.frontier.begin(), state.frontier.end()), state.frontier.end());
+		if (state.frontier.size() != 1) {
+			throw InvalidInputException("GQL weighted SSSP requires exactly one distinct source vertex");
+		}
+		auto bind = make_uniq<WeightedSsspBindData>();
+		bind->graph_name = graph_name;
+		bind->start_vertex_id = state.frontier[0];
+		bind->weight_property = data.configuration[1].value;
+		if (bind->weight_property.empty()) {
+			throw BinderException("GQL weighted SSSP requires a non-empty edge weight property");
+		}
+		bind->vertex_label = data.configuration.size() > 2 ? data.configuration[2].value : string();
+		bind->edge_label = data.configuration.size() > 3 ? data.configuration[3].value : string();
+		if (data.configuration.size() > 4) {
+			bind->has_target = true;
+			bind->target_vertex_id = std::stoull(data.configuration[4].value);
+		}
+		state.nested_bind_data = std::move(bind);
+		state.nested_global_state = make_uniq<WeightedSsspState>();
+	} else if (name == "bfs" || name == "sssp") {
 		InitializePipelineBfs(context.client, data, state);
 		auto source_count = state.nested_global_state->Cast<BfsState>().queue.size();
 		if (name == "sssp" && source_count != 1) {
@@ -2800,7 +3034,9 @@ static OperatorFinalizeResultType AlgorithmCallFinalize(ExecutionContext &contex
 		PipelineDfsFunction(context.client, state.nested_global_state->Cast<PipelineDfsState>(), output);
 	} else {
 		TableFunctionInput nested(state.nested_bind_data.get(), nullptr, state.nested_global_state.get());
-		if (data.definition->name == "pagerank") {
+		if (data.definition->name == "weighted_sssp") {
+			WeightedSsspFunction(context.client, nested, output);
+		} else if (data.definition->name == "pagerank") {
 			PageRankFunction(context.client, nested, output);
 		} else if (data.definition->name == "wcc") {
 			WccFunction(context.client, nested, output);
@@ -2873,6 +3109,18 @@ TableFunction GqlSsspFunction() {
 	function.bind = SsspBind;
 	function.init_global = BfsInit;
 	AddTraversalNamedParameters(function);
+	return function;
+}
+
+TableFunction GqlWeightedSsspFunction() {
+	TableFunction function("weighted_sssp", {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR},
+	                       WeightedSsspFunction);
+	function.bind = WeightedSsspBind;
+	function.init_global = WeightedSsspInit;
+	function.named_parameters["direction"] = LogicalType::VARCHAR;
+	function.named_parameters["edge_label"] = LogicalType::VARCHAR;
+	function.named_parameters["vertex_label"] = LogicalType::VARCHAR;
+	function.named_parameters["target_vertex_id"] = LogicalType::BIGINT;
 	return function;
 }
 

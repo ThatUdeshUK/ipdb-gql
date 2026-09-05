@@ -1,0 +1,316 @@
+# name: test/sql/gql_weighted_sssp.test
+# description: Weighted Dijkstra, aligned CSR projections, and cache invalidation
+# group: [gql]
+
+require duckgql
+
+statement ok
+COPY (SELECT * FROM (VALUES ('1','node;selected'), ('2','node;selected'),
+('3','node;selected'), ('4','node;selected'), ('5','node'), ('6','node'))
+v("id:ID", ":LABEL")) TO '__TEST_DIR__/weighted_nodes.csv' (HEADER, FORMAT CSV)
+
+statement ok
+COPY (SELECT * FROM (VALUES
+('1','2','route',9.0,1), ('1','3','route',1.5,8), ('3','2','route',1.0,1),
+('2','4','route',0.0,1), ('3','4','route',8.0,1), ('4','3','route',0.0,1),
+('1','2','route',12.0,1), ('4','4','route',0.0,1), ('1','5','other',0.25,4))
+e(":START_ID", ":END_ID", ":TYPE", "cost:double", "time:int"))
+TO '__TEST_DIR__/weighted_edges.csv' (HEADER, FORMAT CSV)
+
+statement ok
+CREATE GRAPH weighted ANY
+
+statement ok
+COPY GRAPH weighted FROM (VERTICES '__TEST_DIR__/weighted_nodes.csv', EDGES '__TEST_DIR__/weighted_edges.csv') FORMAT GRAPH
+
+statement ok
+SESSION SET GRAPH weighted
+
+# Cheaper indirect paths, fractional and zero weights, parallel edges, and cycles.
+query IRIII
+CALL algo.weighted_sssp('weighted', 1, 'cost')
+----
+1	0.000	NULL	NULL	0
+5	0.250	1	9	1
+3	1.500	1	2	2
+2	2.500	3	3	3
+4	2.500	2	4	4
+
+statement ok
+CREATE TEMP TABLE weight_builds AS SELECT build_count, memory_bytes FROM gql_csr_stats('weighted', weight_property := 'cost')
+
+query I
+SELECT count(*) FROM system.algo.weighted_sssp('weighted', 1, 'COST')
+----
+5
+
+query I weighted_reader
+SELECT count(*) FROM system.algo.weighted_sssp('weighted', 1, 'cost')
+----
+5
+
+query I
+SELECT s.build_count = b.build_count FROM gql_csr_stats('weighted', weight_property := 'cost') s, weight_builds b
+----
+true
+
+# A different property has a separate cache entry and different distances.
+query IR rowsort
+SELECT vertex_id, distance FROM system.algo.weighted_sssp('weighted', 1, 'time')
+----
+1	0.000
+2	1.000
+3	3.000
+4	2.000
+5	4.000
+
+query I
+SELECT s.build_count = b.build_count + 1 FROM gql_csr_stats('weighted', weight_property := 'time') s, weight_builds b
+----
+true
+
+query I
+SELECT count(*) FROM system.algo.weighted_sssp('weighted', 1, 'cost')
+----
+5
+
+query I
+SELECT s.build_count = b.build_count + 1 FROM gql_csr_stats('weighted', weight_property := 'cost') s, weight_builds b
+----
+true
+
+# Building unweighted/full topology must not evict weighted projections.
+statement ok
+CALL gql_build_csr('weighted')
+
+query I
+SELECT count(*) FROM system.algo.weighted_sssp('weighted', 1, 'cost')
+----
+5
+
+query I
+SELECT s.build_count = b.build_count + 2 FROM gql_csr_stats('weighted', weight_property := 'cost') s, weight_builds b
+----
+true
+
+# SQL and GQL projections, target termination, and matched sources.
+query IR
+CALL algo.weighted_sssp('weighted', 1, 'cost', target_vertex_id := 3)
+YIELD vertex_id, distance RETURN vertex_id, distance
+----
+1	0.000
+5	0.250
+3	1.500
+
+query IR
+MATCH (seed:node) WHERE seed.id = '1'
+CALL algo.weighted_sssp('weighted', element_id(seed), 'cost', 'selected', 'route', 4)
+YIELD vertex_id, distance RETURN vertex_id, distance
+----
+1	0.000
+3	1.500
+2	2.500
+4	2.500
+
+query IR
+SELECT vertex_id, distance FROM system.algo.weighted_sssp('weighted', 6, 'cost')
+----
+6	0.000
+
+query I
+SELECT count(*) FROM system.algo.weighted_sssp('weighted', 1, 'cost', target_vertex_id := 6)
+----
+5
+
+query IR rowsort
+SELECT vertex_id, distance FROM system.algo.weighted_sssp('weighted', 4, 'cost', direction := 'in')
+----
+1	2.500
+2	0.000
+3	1.000
+4	0.000
+
+query IR rowsort
+SELECT vertex_id, distance FROM system.algo.weighted_sssp('weighted', 4, 'cost', direction := 'both')
+----
+1	1.500
+2	0.000
+3	0.000
+4	0.000
+5	1.750
+
+statement error
+CALL algo.weighted_sssp('weighted', 1, 'missing')
+----
+not mapped
+
+statement error
+CALL algo.weighted_sssp('weighted', 1, '')
+----
+non-empty edge weight property
+
+statement error
+CALL algo.weighted_sssp('weighted', 100, 'cost')
+----
+vertex
+
+statement error
+MATCH (seed:node)
+CALL algo.weighted_sssp('weighted', element_id(seed), 'cost')
+YIELD vertex_id RETURN vertex_id
+----
+exactly one distinct source
+
+statement error
+MATCH (seed:node) WHERE seed.id = 'absent'
+CALL algo.weighted_sssp('weighted', element_id(seed), 'cost')
+YIELD vertex_id RETURN vertex_id
+----
+exactly one distinct source
+
+# Weight mutation invalidates all versions of the cached graph projection.
+statement ok
+SESSION SET GRAPH weighted
+
+statement ok
+MATCH (a:node)-[e:route]->(b:node) WHERE a.id = '1' AND b.id = '3' SET e.cost = 0.5
+
+query IR
+SELECT vertex_id, distance FROM system.algo.weighted_sssp('weighted', 1, 'cost') WHERE vertex_id = 4
+----
+4	1.500
+
+# Invalid weights are rejected even when unreachable or the target is the source.
+statement ok
+INSERT (:node {id: 'bad-a'})-[:other {cost: -1}]->(:node {id: 'bad-b'})
+
+statement error
+CALL algo.weighted_sssp('weighted', 1, 'cost', target_vertex_id := 1)
+----
+finite, non-negative, non-NULL
+
+# Labels exclude invalid edges outside the selected projection.
+query I
+SELECT count(*) FROM system.algo.weighted_sssp('weighted', 1, 'cost', edge_label := 'route')
+----
+4
+
+query I
+SELECT count(*) FROM system.algo.weighted_sssp('weighted', 1, 'cost', vertex_label := 'selected')
+----
+4
+
+statement ok
+MATCH (a:node)-[e:other]->(b:node) WHERE a.id = 'bad-a' SET e.cost = NULL
+
+statement error
+CALL algo.weighted_sssp('weighted', 1, 'cost')
+----
+finite, non-negative, non-NULL
+
+statement ok
+BEGIN TRANSACTION
+
+statement error
+CALL algo.weighted_sssp('weighted', 1, 'cost')
+----
+explicit transaction
+
+statement ok
+ROLLBACK
+
+# Referenced numeric properties use mapped columns, including DECIMAL weights.
+statement ok
+ATTACH ':memory:' AS weight_source
+
+statement ok
+CREATE TABLE weight_source.main.weighted_points(id BIGINT PRIMARY KEY)
+
+statement ok
+INSERT INTO weight_source.main.weighted_points VALUES (10), (20), (30)
+
+statement ok
+CREATE TABLE weight_source.main.weighted_roads(id BIGINT PRIMARY KEY, src BIGINT, dst BIGINT, cost DECIMAL(12,2), bad VARCHAR, huge DOUBLE)
+
+statement ok
+INSERT INTO weight_source.main.weighted_roads VALUES (1,10,20,1.25,'1',1e308), (2,20,30,2.5,'2',1e308)
+
+statement ok
+CREATE GRAPH weighted_ref TYPED {
+    (Point :Point {id INT64}),
+    (Point)-[:Road {cost DECIMAL(12,2), bad STRING, huge FLOAT64}]->(Point)
+}
+FROM TABLES (
+    VERTEX TABLE weight_source.main.weighted_points MAP TO NODE TYPE Point KEY (id) PROPERTIES (id AS id),
+    EDGE TABLE weight_source.main.weighted_roads MAP TO EDGE TYPE Road KEY (id)
+    SOURCE (src) REFERENCES NODE TYPE Point DESTINATION (dst) REFERENCES NODE TYPE Point
+    PROPERTIES (cost AS cost, bad AS bad, huge AS huge)
+)
+
+query IR
+CALL algo.weighted_sssp('weighted_ref', 1, 'cost') YIELD vertex_id, distance RETURN vertex_id, distance
+----
+1	0.000
+2	1.250
+3	3.750
+
+statement error
+CALL algo.weighted_sssp('weighted_ref', 1, 'bad')
+----
+numeric type
+
+statement error
+CALL algo.weighted_sssp('weighted_ref', 1, 'huge')
+----
+distance overflow
+
+statement ok
+UPDATE weight_source.main.weighted_roads SET huge = 'NaN'::DOUBLE WHERE id = 2
+
+statement error
+CALL algo.weighted_sssp('weighted_ref', 1, 'huge', target_vertex_id := 1)
+----
+finite, non-negative, non-NULL
+
+statement ok
+UPDATE weight_source.main.weighted_roads SET huge = 'Infinity'::DOUBLE WHERE id = 2
+
+statement error
+CALL algo.weighted_sssp('weighted_ref', 1, 'huge')
+----
+finite, non-negative, non-NULL
+
+# Prepared writes invalidate a previously built weight projection on every execution.
+statement ok
+PREPARE update_weight AS UPDATE weight_source.main.weighted_roads SET cost = $1 WHERE id = 1
+
+statement ok
+PREPARE read_weight AS SELECT distance FROM system.algo.weighted_sssp('weighted_ref', 1, 'cost') WHERE vertex_id = 3
+
+statement ok
+EXECUTE update_weight(2)
+
+query R
+EXECUTE read_weight
+----
+4.500
+
+statement ok
+EXECUTE update_weight(4)
+
+query R
+EXECUTE read_weight
+----
+6.500
+
+# Traversal must resume correctly across output vector boundaries.
+statement ok
+INSERT INTO weight_source.main.weighted_points SELECT i FROM range(31, 4128) r(i)
+
+statement ok
+INSERT INTO weight_source.main.weighted_roads SELECT i, i-1, i, 0.25, '', 0 FROM range(31, 4128) r(i)
+
+query IR
+SELECT count(*), max(distance) FROM system.algo.weighted_sssp('weighted_ref', 1, 'cost')
+----
+4100	1030.750

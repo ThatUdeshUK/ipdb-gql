@@ -479,10 +479,6 @@ shared_ptr<GqlInsertStatement> GqlTransformer::TransformInsert(GQLParser::Insert
 		Unsupported(context, "empty INSERT path list");
 		return nullptr;
 	}
-	if (paths.size() > 1 && allow_expressions) {
-		Unsupported(context, "multiple INSERT paths in a MATCH pipeline");
-		return nullptr;
-	}
 	auto insert = make_shared_ptr<GqlInsertStatement>(SourceRange(context));
 	for (auto path : paths) {
 		auto nodes = path->insertNodePattern();

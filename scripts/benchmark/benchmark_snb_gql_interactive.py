@@ -653,18 +653,10 @@ PRAGMA enable_profiling='json';
     }
 
 
-def benchmark_cases(
-    cli: Path,
-    relational_database: Path,
-    graph_database: Path,
+def build_benchmark_cases(
     relational_results: Path,
-    threads: int,
-    memory_limit: str,
-    warmups: int,
-    runs: int,
-    timeout: float,
     selected_queries: set[str] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, str]]:
     reference = json.loads(relational_results.read_text())
     params = {
         name: entry["parameters"]
@@ -1244,6 +1236,22 @@ RETURN distance;
             if name in selected_queries
         }
 
+    return cases, unsupported
+
+
+def benchmark_cases(
+    cli: Path,
+    relational_database: Path,
+    graph_database: Path,
+    relational_results: Path,
+    threads: int,
+    memory_limit: str,
+    warmups: int,
+    runs: int,
+    timeout: float,
+    selected_queries: set[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    cases, unsupported = build_benchmark_cases(relational_results, selected_queries)
     results: dict[str, Any] = {}
     for name, case in cases.items():
         print(f"[{name}] validating SQL and GQL rows", flush=True)

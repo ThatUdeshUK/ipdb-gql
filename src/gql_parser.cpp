@@ -2102,7 +2102,10 @@ ParserExtensionPlanResult GqlPlan(ParserExtensionInfo *, ClientContext &,
 		result.function = GqlResetGraphFunction();
 		return result;
 	case GqlStatementType::INSERT:
-		throw NotImplementedException("GQL INSERT on native graph tables is not implemented yet");
+		// Default parser override mode can fall back here after a lowering error.
+		// Preserve INSERT validation diagnostics in that mode as well.
+		GqlLowerInsert(statement.Cast<GqlInsertStatement>());
+		throw NotImplementedException("GQL INSERT requires DuckDB parser-override lowering");
 	case GqlStatementType::MERGE:
 		throw InternalException("MERGE requires DuckDB parser-override lowering");
 	case GqlStatementType::CALL:

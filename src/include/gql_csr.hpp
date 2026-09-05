@@ -183,6 +183,11 @@ struct GqlCsrEdgeLabelStats {
 
 struct GqlCsrSnapshot {
 	GqlCsrCapabilities capabilities = 0;
+	//! Optional numeric property projected as DOUBLE, aligned with adjacency.
+	string weight_property;
+	unordered_map<string, uint64_t> source_write_generations;
+	vector<double> outgoing_weights;
+	vector<double> incoming_weights;
 	uint64_t graph_id;
 	uint64_t graph_version;
 	uint64_t write_generation;
@@ -228,9 +233,11 @@ bool GqlTryGetCsrOrdinal(const GqlCsrSnapshot &snapshot, uint64_t vertex_id, idx
 shared_ptr<const GqlCsrSnapshot> GqlGetCsrSnapshot(ClientContext &context, const string &graph_name);
 
 //! Return a current capability-compatible snapshot, building it automatically
-//! when the database instance has not prepared one yet.
+//! when the database instance has not prepared one yet. Weight properties have
+//! separate cache entries; an empty property requests topology without weights.
 shared_ptr<const GqlCsrSnapshot> GqlGetOrBuildCsrSnapshot(ClientContext &context, const string &graph_name,
-                                                          GqlCsrCapabilities capabilities, bool *built = nullptr);
+                                                          GqlCsrCapabilities capabilities, bool *built = nullptr,
+                                                          const string &weight_property = string());
 
 //! Returns a current database-scoped snapshot when one is available and valid.
 //! Unlike GqlGetCsrSnapshot, this is a non-throwing optimizer probe.
@@ -252,6 +259,7 @@ TableFunction GqlCsrVerticesFunction();
 TableFunction GqlCsrExpandFunction();
 TableFunction GqlCsrPathExpandFunction();
 TableFunction GqlVertexFetchFunction();
+TableFunction GqlProjectedVertexFetchFunction();
 TableFunction GqlEdgeFetchFunction();
 TableFunction GqlBuildCsrFunction();
 TableFunction GqlCsrStatsFunction();

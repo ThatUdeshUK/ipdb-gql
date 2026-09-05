@@ -774,6 +774,7 @@ static GqlElementTableBinding BuildReferencedUnion(Connection &connection, uint6
 	}
 	for (idx_t table_index = 0; table_index < tables.size(); table_index++) {
 		auto &entry = tables[table_index];
+		result.source_tables.push_back({entry.table.catalog_name, entry.table.schema_name, entry.table.table_name});
 		if (entry.table.ownership != "REFERENCED") {
 			throw InvalidInputException("Heterogeneous table-backed graphs require referenced element tables");
 		}

@@ -785,6 +785,28 @@ GqlAccessPathPlan GqlOptimizeAccessPaths(ClientContext &context, const string &g
 				edge_path.minimum_repetitions = edge.minimum_repetitions;
 				edge_path.maximum_repetitions = edge.maximum_repetitions;
 				edge_path.unbounded = edge.unbounded;
+				if (input.duplicate_insensitive && edge_path.type == GqlBindingAccessPathType::CSR_PATH_EXPANSION) {
+					idx_t occurrences = 0;
+					bool edge_observed = false;
+					for (const auto &other_stage : input.match_stages) {
+						for (const auto &other_pattern : other_stage.patterns) {
+							for (const auto &element : other_pattern.elements) {
+								occurrences += element.binding_index == edge.binding_index;
+							}
+						}
+					}
+					for (const auto &programs : {&input.projections, &input.predicates}) {
+						for (const auto &program : *programs) {
+							for (const auto binding : program.binding_indices) {
+								edge_observed |= binding == edge.binding_index;
+							}
+						}
+					}
+					// This three-element pattern has no sibling edges whose TRAIL
+					// uniqueness could observe its edge identity. Keep enumeration
+					// semantics inside VLP, then collapse only equivalent endpoints.
+					edge_path.distinct_endpoints = occurrences == 1 && !edge_observed;
+				}
 				edge_path.fetch_edge_properties =
 				    stage_allows_element_fetch &&
 				    edge_path.type == GqlBindingAccessPathType::CSR_EDGE_PROPERTY_EXPANSION && can_fetch_edges &&
@@ -801,6 +823,9 @@ GqlAccessPathPlan GqlOptimizeAccessPaths(ClientContext &context, const string &g
 				    neighbor_path.type == GqlBindingAccessPathType::TABLE_SCAN &&
 				    BatchedElementFetchBeatsScan(selected_estimated_rows)) {
 					neighbor_path.type = GqlBindingAccessPathType::BATCHED_ELEMENT_FETCH;
+					if (neighbor_binding < input.vertex_fetch_columns.size()) {
+						neighbor_path.fetch_columns = input.vertex_fetch_columns[neighbor_binding];
+					}
 					neighbor_path.fetch_id_binding = edge.binding_index;
 					if (neighbor_binding == left.binding_index) {
 						neighbor_path.fetch_id_column = edge.reverse ? "__gql_target_id" : "__gql_source_id";

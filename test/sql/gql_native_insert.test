@@ -299,3 +299,131 @@ statement error
 INSERT (:Person)~[:KNOWS]~(:Person)
 ----
 <REGEX>:.*undirected edge INSERT patterns.*
+
+# Disconnected paths share one command, with anonymous nodes allocated separately.
+statement ok
+INSERT (:Person {external_id: 'multi-a', age: 1}),
+       (:Person {external_id: 'multi-b', age: 2})
+
+query I
+MATCH (p:Person) WHERE p.external_id = 'multi-a' OR p.external_id = 'multi-b'
+RETURN count(*)
+----
+2
+
+# Repeated named endpoints create one node, including cycles and mixed arrows.
+statement ok
+INSERT (a:Person {external_id: 'shared-a', age: 3})
+       -[:KNOWS {since: 2060}]->(b:Person {external_id: 'shared-b', age: 4}),
+       (b)<-[:KNOWS {since: 2061}]-(a),
+       (a)-[:KNOWS {since: 2062}]->(a)
+
+query I
+MATCH (p:Person) WHERE p.external_id = 'shared-a' OR p.external_id = 'shared-b'
+RETURN count(*)
+----
+2
+
+query TTI rowsort
+MATCH (a:Person)-[e:KNOWS]->(b:Person) WHERE a.external_id = 'shared-a'
+RETURN a.external_id, b.external_id, e.since
+----
+shared-a	shared-a	2062
+shared-a	shared-b	2060
+shared-a	shared-b	2061
+
+# Declarations must be unique across the entire graph pattern.
+statement error
+INSERT (a:Person {external_id: 'duplicate-path'}), (a:Person)
+----
+<REGEX>:.*node variable 'a' is already defined.*
+
+statement error
+INSERT (a:Person)-[a:KNOWS]->(:Person)
+----
+<REGEX>:.*edge variable 'a' is already bound.*
+
+statement error
+INSERT (:Person)-[e:KNOWS]->(:Person), (:Person)-[e:KNOWS]->(:Person)
+----
+<REGEX>:.*edge variable 'e' is already bound.*
+
+query I
+MATCH (p:Person) WHERE p.external_id = 'duplicate-path'
+RETURN count(*)
+----
+0
+
+# A failure in a later disconnected path rolls back the entire command.
+statement error
+INSERT (:Person {external_id: 'multi-atomic', age: 1}),
+       (:Person {external_id: 'multi-bad', age: 'invalid'})
+----
+<REGEX>:.*Could not convert string.*
+
+query I
+MATCH (p:Person) WHERE p.external_id = 'multi-atomic' OR p.external_id = 'multi-bad'
+RETURN count(*)
+----
+0
+
+# Each matched row gets one shared new node across the two inserted paths.
+statement ok
+MATCH (p:Person) WHERE p.external_id = 'multi-a' OR p.external_id = 'multi-b'
+INSERT (p)-[:KNOWS {since: 2070}]->
+       (n:Person {external_id: p.external_id || '-shared', age: p.age + 10}),
+       (n)-[:KNOWS {since: 2071}]->(p)
+
+query TTI rowsort
+MATCH (p:Person)-[e:KNOWS]->(n:Person)-[:KNOWS]->(p)
+WHERE e.since = 2070
+RETURN p.external_id, n.external_id, n.age
+----
+multi-a	multi-a-shared	11
+multi-b	multi-b-shared	12
+
+# An empty input creates no nodes in any path.
+statement ok
+MATCH (p:Person) WHERE p.external_id = 'nonexistent-multi'
+INSERT (:Person {external_id: 'empty-multi-a'}), (:Person {external_id: 'empty-multi-b'})
+
+query I
+MATCH (p:Person) WHERE p.external_id = 'empty-multi-a' OR p.external_id = 'empty-multi-b'
+RETURN count(*)
+----
+0
+
+statement error
+MATCH (p:Person) WHERE p.external_id = 'multi-a'
+INSERT (p)-[:KNOWS {since: 2080}]->(:Person {external_id: 'matched-multi-atomic', age: 1}),
+       (:Person {external_id: 'matched-multi-bad', age: 'invalid'})
+----
+<REGEX>:.*Could not convert string.*
+
+query I
+MATCH (p:Person) WHERE p.external_id = 'matched-multi-atomic' OR p.external_id = 'matched-multi-bad'
+RETURN count(*)
+----
+0
+
+# Caller rollback covers every path and shared endpoint.
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT (a:Person {external_id: 'multi-rollback'}), (a)-[:KNOWS]->(a)
+
+query I
+MATCH (p:Person)-[:KNOWS]->(p) WHERE p.external_id = 'multi-rollback'
+RETURN count(*)
+----
+1
+
+statement ok
+ROLLBACK
+
+query I
+MATCH (p:Person) WHERE p.external_id = 'multi-rollback'
+RETURN count(*)
+----
+0

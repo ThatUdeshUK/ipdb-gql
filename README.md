@@ -28,7 +28,7 @@ storage and execution engine, plus an explicit CSR layer for graph algorithms.
   subset.
 - Standalone node and directed-path `INSERT`, fixed directed
   `MATCH`-and-`INSERT`, property `SET` and `REMOVE`, and edge/node deletion.
-- Explicit CSR-backed BFS, DFS, unweighted SSSP, PageRank, weak and strong
+- Explicit CSR-backed BFS, DFS, unweighted and weighted SSSP, PageRank, weak and strong
   components, Louvain community detection, degree, closeness, local clustering
   coefficient, and triangle counting.
 - Caller-controlled DuckDB transactions for graph queries and mutations, plus
@@ -313,7 +313,35 @@ automatically, with concurrent automatic builders coalesced per graph. Run
 optimizer/neighbor/inspection snapshot. CSR construction and CSR algorithms
 must run in autocommit mode.
 
-Weighted SSSP is not implemented.
+Use weighted SSSP to find cheapest directed paths using a numeric edge property:
+
+```sql
+CALL algo.weighted_sssp('social', 1, 'cost')
+YIELD vertex_id, distance, parent_vertex_id, edge_id
+RETURN vertex_id, distance, parent_vertex_id, edge_id;
+```
+
+Distances use `DOUBLE` arithmetic. Only reachable vertices are returned, in
+settlement order, with distance zero and NULL parent/edge IDs for the source.
+`target_vertex_id := 42` stops after settling the target and returns the settled
+prefix. `direction := 'in'` or `'both'`, `vertex_label`, and `edge_label` select
+the traversal projection. Every selected edge must have a finite, non-negative,
+non-NULL weight, including unreachable edges; zero weights and parallel edges
+are supported. Distance overflow raises an error. Equal-cost parent choices
+are not guaranteed across graph reloads.
+
+Weighted projections are cached separately by property and invalidated on graph
+writes. Inspect one with `gql_csr_stats('social', weight_property := 'cost')`;
+its `memory_bytes` includes the aligned weight arrays. Weighted SSSP uses a
+single worker and an indexed priority queue with O(V) traversal working memory.
+Matched calls accept exactly one distinct source:
+
+```sql
+MATCH (seed:Person) WHERE seed.name = 'Ada'
+CALL algo.weighted_sssp('social', element_id(seed), 'cost')
+YIELD vertex_id, distance
+RETURN vertex_id, distance;
+```
 
 Inspection helpers:
 
