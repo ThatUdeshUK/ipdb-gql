@@ -3,6 +3,7 @@
 #include "gql_ast.hpp"
 #include "gql_catalog.hpp"
 #include "gql_ir.hpp"
+#include "gql_llm.hpp"
 #include "gql_optimizer.hpp"
 #include "gql_storage.hpp"
 
@@ -29,6 +30,11 @@
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+
+#if __has_include("duckdb/parser/expression/predict_expression.hpp")
+#include "duckdb/parser/expression/predict_expression.hpp"
+#define GQL_HAS_IPDB_PREDICT 1
+#endif
 
 namespace duckdb {
 
@@ -638,6 +644,7 @@ static idx_t ExpressionEnd(const GqlExpressionProgram &program, idx_t node) {
 	case GqlExpressionType::BINARY:
 		return ExpressionEnd(program, ExpressionEnd(program, cursor));
 	case GqlExpressionType::FUNCTION:
+	case GqlExpressionType::LLM:
 		for (idx_t child = 0; child < program.child_counts[node]; child++) {
 			cursor = ExpressionEnd(program, cursor);
 		}
@@ -700,7 +707,53 @@ static unique_ptr<ParsedExpression> ElementHasLabel(const RelationalPropertyAcce
 static unique_ptr<ParsedExpression> LowerExpression(const GqlExpressionProgram &program, idx_t &cursor,
                                                     const RelationalPropertyMap &property_aliases,
                                                     const vector<RelationalIdentityAccess> &identities,
-                                                    GqlTypeId desired_type = GqlTypeId::UNKNOWN) {
+                                                    GqlTypeId desired_type = GqlTypeId::UNKNOWN);
+
+static unique_ptr<ParsedExpression> LowerLlmExpression(const GqlExpressionProgram &program, idx_t node, idx_t &cursor,
+                                                       const RelationalPropertyMap &property_aliases,
+                                                       const vector<RelationalIdentityAccess> &identities) {
+#ifdef GQL_HAS_IPDB_PREDICT
+	const auto &prompt = program.values[node];
+	auto inputs = GqlLlmInputs(prompt);
+	auto outputs = GqlLlmOutputs(prompt);
+	if (inputs.size() != program.child_counts[node] || outputs.size() != 1) {
+		throw InternalException("GQL LLM program does not match its prompt");
+	}
+	auto result = make_uniq<PredictExpression>();
+	result->model_name = program.properties[node];
+	result->prompt = prompt;
+	result->agg = program.aggregate[node];
+	for (auto &input : inputs) {
+		result->input_col_names.push_back(std::move(input.name));
+		auto child = LowerExpression(program, cursor, property_aliases, identities);
+		if (result->agg) {
+			child = make_uniq<CastExpression>(LogicalType::VARCHAR, std::move(child));
+		}
+		result->children.push_back(std::move(child));
+	}
+	const auto &type = outputs[0].type;
+	result->out_col_name = outputs[0].name;
+	if (type == "VARCHAR") {
+		result->out_col_type = LogicalType::VARCHAR;
+	} else if (type == "INTEGER") {
+		result->out_col_type = LogicalType::INTEGER;
+	} else if (type == "BOOLEAN" || type == "BOOL") {
+		result->out_col_type = LogicalType::BOOLEAN;
+	} else if (type == "DOUBLE") {
+		result->out_col_type = LogicalType::DOUBLE;
+	} else {
+		throw InternalException("GQL LLM program has an unsupported output type");
+	}
+	return std::move(result);
+#else
+	throw NotImplementedException("GQL LLM expressions require DuckDB built from iPDB");
+#endif
+}
+
+static unique_ptr<ParsedExpression> LowerExpression(const GqlExpressionProgram &program, idx_t &cursor,
+                                                    const RelationalPropertyMap &property_aliases,
+                                                    const vector<RelationalIdentityAccess> &identities,
+                                                    GqlTypeId desired_type) {
 	if (cursor >= program.node_types.size()) {
 		throw InternalException("Truncated GQL expression program");
 	}
@@ -741,6 +794,8 @@ static unique_ptr<ParsedExpression> LowerExpression(const GqlExpressionProgram &
 	}
 	case GqlExpressionType::ELEMENT_ID:
 		return LowerExpression(program, cursor, property_aliases, identities);
+	case GqlExpressionType::LLM:
+		return LowerLlmExpression(program, node, cursor, property_aliases, identities);
 	case GqlExpressionType::FUNCTION: {
 		auto name = program.values[node];
 		if (name == "path_length") {
@@ -922,6 +977,9 @@ static bool AllowsDuplicateElimination(const GqlExpressionProgram &program) {
 		return false;
 	}
 	for (idx_t node = 0; node < program.node_types.size(); node++) {
+		if (static_cast<GqlExpressionType>(program.node_types[node]) == GqlExpressionType::LLM) {
+			return false;
+		}
 		if (static_cast<GqlExpressionType>(program.node_types[node]) == GqlExpressionType::FUNCTION &&
 		    !StringUtil::CIEquals(program.values[node], "coalesce") &&
 		    !StringUtil::CIEquals(program.values[node], "element_id")) {

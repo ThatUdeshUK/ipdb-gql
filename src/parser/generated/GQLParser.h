@@ -1,5 +1,5 @@
 
-// Generated from third_party/opengql/GQL.g4 by ANTLR 4.13.2
+// Generated from /home/udeshuk/Developer/duckdb-gql/third_party/opengql/GQL.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -79,25 +79,26 @@ public:
     READ = 306, RELATIONSHIP = 307, RELATIONSHIPS = 308, REPEATABLE = 309, 
     SHORTEST = 310, SIMPLE = 311, SOURCE = 312, TABLE = 313, TO = 314, TRAIL = 315, 
     TRANSACTION = 316, TYPE = 317, UNDIRECTED = 318, VERTEX = 319, WALK = 320, 
-    WITHOUT = 321, WRITE = 322, ZONE = 323, REGULAR_IDENTIFIER = 324, SUBSTITUTED_PARAMETER_REFERENCE = 325, 
-    GENERAL_PARAMETER_REFERENCE = 326, MULTISET_ALTERNATION_OPERATOR = 327, 
-    BRACKET_RIGHT_ARROW = 328, BRACKET_TILDE_RIGHT_ARROW = 329, CONCATENATION_OPERATOR = 330, 
-    DOUBLE_COLON = 331, DOUBLE_DOLLAR_SIGN = 332, DOUBLE_PERIOD = 333, GREATER_THAN_OR_EQUALS_OPERATOR = 334, 
-    LEFT_ARROW = 335, LEFT_ARROW_TILDE = 336, LEFT_ARROW_BRACKET = 337, 
-    LEFT_ARROW_TILDE_BRACKET = 338, LEFT_MINUS_RIGHT = 339, LEFT_MINUS_SLASH = 340, 
-    LEFT_TILDE_SLASH = 341, LESS_THAN_OR_EQUALS_OPERATOR = 342, MINUS_LEFT_BRACKET = 343, 
-    MINUS_SLASH = 344, NOT_EQUALS_OPERATOR = 345, RIGHT_ARROW = 346, RIGHT_BRACKET_MINUS = 347, 
-    RIGHT_BRACKET_TILDE = 348, RIGHT_DOUBLE_ARROW = 349, SLASH_MINUS = 350, 
-    SLASH_MINUS_RIGHT = 351, SLASH_TILDE = 352, SLASH_TILDE_RIGHT = 353, 
-    TILDE_LEFT_BRACKET = 354, TILDE_RIGHT_ARROW = 355, TILDE_SLASH = 356, 
-    AMPERSAND = 357, ASTERISK = 358, COLON = 359, COMMA = 360, COMMERCIAL_AT = 361, 
-    DOLLAR_SIGN = 362, DOUBLE_QUOTE = 363, EQUALS_OPERATOR = 364, EXCLAMATION_MARK = 365, 
-    RIGHT_ANGLE_BRACKET = 366, GRAVE_ACCENT = 367, LEFT_BRACE = 368, LEFT_BRACKET = 369, 
-    LEFT_PAREN = 370, LEFT_ANGLE_BRACKET = 371, MINUS_SIGN = 372, PERCENT = 373, 
-    PERIOD = 374, PLUS_SIGN = 375, QUESTION_MARK = 376, QUOTE = 377, REVERSE_SOLIDUS = 378, 
-    RIGHT_BRACE = 379, RIGHT_BRACKET = 380, RIGHT_PAREN = 381, SOLIDUS = 382, 
-    TILDE = 383, UNDERSCORE = 384, VERTICAL_BAR = 385, SP = 386, WHITESPACE = 387, 
-    BRACKETED_COMMENT = 388, SIMPLE_COMMENT_SOLIDUS = 389, SIMPLE_COMMENT_MINUS = 390
+    WITHOUT = 321, WRITE = 322, ZONE = 323, AGG = 324, LLM = 325, PROMPT = 326, 
+    REGULAR_IDENTIFIER = 327, SUBSTITUTED_PARAMETER_REFERENCE = 328, GENERAL_PARAMETER_REFERENCE = 329, 
+    MULTISET_ALTERNATION_OPERATOR = 330, BRACKET_RIGHT_ARROW = 331, BRACKET_TILDE_RIGHT_ARROW = 332, 
+    CONCATENATION_OPERATOR = 333, DOUBLE_COLON = 334, DOUBLE_DOLLAR_SIGN = 335, 
+    DOUBLE_PERIOD = 336, GREATER_THAN_OR_EQUALS_OPERATOR = 337, LEFT_ARROW = 338, 
+    LEFT_ARROW_TILDE = 339, LEFT_ARROW_BRACKET = 340, LEFT_ARROW_TILDE_BRACKET = 341, 
+    LEFT_MINUS_RIGHT = 342, LEFT_MINUS_SLASH = 343, LEFT_TILDE_SLASH = 344, 
+    LESS_THAN_OR_EQUALS_OPERATOR = 345, MINUS_LEFT_BRACKET = 346, MINUS_SLASH = 347, 
+    NOT_EQUALS_OPERATOR = 348, RIGHT_ARROW = 349, RIGHT_BRACKET_MINUS = 350, 
+    RIGHT_BRACKET_TILDE = 351, RIGHT_DOUBLE_ARROW = 352, SLASH_MINUS = 353, 
+    SLASH_MINUS_RIGHT = 354, SLASH_TILDE = 355, SLASH_TILDE_RIGHT = 356, 
+    TILDE_LEFT_BRACKET = 357, TILDE_RIGHT_ARROW = 358, TILDE_SLASH = 359, 
+    AMPERSAND = 360, ASTERISK = 361, COLON = 362, COMMA = 363, COMMERCIAL_AT = 364, 
+    DOLLAR_SIGN = 365, DOUBLE_QUOTE = 366, EQUALS_OPERATOR = 367, EXCLAMATION_MARK = 368, 
+    RIGHT_ANGLE_BRACKET = 369, GRAVE_ACCENT = 370, LEFT_BRACE = 371, LEFT_BRACKET = 372, 
+    LEFT_PAREN = 373, LEFT_ANGLE_BRACKET = 374, MINUS_SIGN = 375, PERCENT = 376, 
+    PERIOD = 377, PLUS_SIGN = 378, QUESTION_MARK = 379, QUOTE = 380, REVERSE_SOLIDUS = 381, 
+    RIGHT_BRACE = 382, RIGHT_BRACKET = 383, RIGHT_PAREN = 384, SOLIDUS = 385, 
+    TILDE = 386, UNDERSCORE = 387, VERTICAL_BAR = 388, SP = 389, WHITESPACE = 390, 
+    BRACKETED_COMMENT = 391, SIMPLE_COMMENT_SOLIDUS = 392, SIMPLE_COMMENT_MINUS = 393
   };
 
   enum {
@@ -260,61 +261,62 @@ public:
     RuleFoldCharacterString = 415, RuleTrimMultiCharacterCharacterString = 416, 
     RuleNormalizeCharacterString = 417, RuleNodeReferenceValueExpression = 418, 
     RuleEdgeReferenceValueExpression = 419, RuleAggregatingValueExpression = 420, 
-    RuleValueExpressionPrimary = 421, RuleParenthesizedValueExpression = 422, 
-    RuleNonParenthesizedValueExpressionPrimary = 423, RuleNonParenthesizedValueExpressionPrimarySpecialCase = 424, 
-    RuleUnsignedValueSpecification = 425, RuleNonNegativeIntegerSpecification = 426, 
-    RuleGeneralValueSpecification = 427, RuleDynamicParameterSpecification = 428, 
-    RuleLetValueExpression = 429, RuleValueQueryExpression = 430, RuleCaseExpression = 431, 
-    RuleCaseAbbreviation = 432, RuleCaseSpecification = 433, RuleSimpleCase = 434, 
-    RuleSearchedCase = 435, RuleSimpleWhenClause = 436, RuleSearchedWhenClause = 437, 
-    RuleElseClause = 438, RuleCaseOperand = 439, RuleWhenOperandList = 440, 
-    RuleWhenOperand = 441, RuleResult = 442, RuleResultExpression = 443, 
-    RuleCastSpecification = 444, RuleCastOperand = 445, RuleCastTarget = 446, 
-    RuleAggregateFunction = 447, RuleGeneralSetFunction = 448, RuleBinarySetFunction = 449, 
-    RuleGeneralSetFunctionType = 450, RuleSetQuantifier = 451, RuleBinarySetFunctionType = 452, 
-    RuleDependentValueExpression = 453, RuleIndependentValueExpression = 454, 
-    RuleElement_idFunction = 455, RuleBindingVariableReference = 456, RulePathValueExpression = 457, 
-    RulePathValueConstructor = 458, RulePathValueConstructorByEnumeration = 459, 
-    RulePathElementList = 460, RulePathElementListStart = 461, RulePathElementListStep = 462, 
-    RuleListValueExpression = 463, RuleListValueFunction = 464, RuleTrimListFunction = 465, 
-    RuleElementsFunction = 466, RuleListValueConstructor = 467, RuleListValueConstructorByEnumeration = 468, 
-    RuleListElementList = 469, RuleListElement = 470, RuleRecordConstructor = 471, 
-    RuleFieldsSpecification = 472, RuleFieldList = 473, RuleField = 474, 
-    RuleTruthValue = 475, RuleNumericValueExpression = 476, RuleNumericValueFunction = 477, 
-    RuleLengthExpression = 478, RuleCardinalityExpression = 479, RuleCardinalityExpressionArgument = 480, 
-    RuleCharLengthExpression = 481, RuleByteLengthExpression = 482, RulePathLengthExpression = 483, 
-    RuleAbsoluteValueExpression = 484, RuleModulusExpression = 485, RuleNumericValueExpressionDividend = 486, 
-    RuleNumericValueExpressionDivisor = 487, RuleTrigonometricFunction = 488, 
-    RuleTrigonometricFunctionName = 489, RuleGeneralLogarithmFunction = 490, 
-    RuleGeneralLogarithmBase = 491, RuleGeneralLogarithmArgument = 492, 
-    RuleCommonLogarithm = 493, RuleNaturalLogarithm = 494, RuleExponentialFunction = 495, 
-    RulePowerFunction = 496, RuleNumericValueExpressionBase = 497, RuleNumericValueExpressionExponent = 498, 
-    RuleSquareRoot = 499, RuleFloorFunction = 500, RuleCeilingFunction = 501, 
-    RuleCharacterStringValueExpression = 502, RuleByteStringValueExpression = 503, 
-    RuleTrimOperands = 504, RuleTrimCharacterOrByteStringSource = 505, RuleTrimSpecification = 506, 
-    RuleTrimCharacterOrByteString = 507, RuleNormalForm = 508, RuleStringLength = 509, 
-    RuleDatetimeValueExpression = 510, RuleDatetimeValueFunction = 511, 
-    RuleDateFunction = 512, RuleTimeFunction = 513, RuleLocaltimeFunction = 514, 
-    RuleDatetimeFunction = 515, RuleLocaldatetimeFunction = 516, RuleDateFunctionParameters = 517, 
-    RuleTimeFunctionParameters = 518, RuleDatetimeFunctionParameters = 519, 
-    RuleDurationValueExpression = 520, RuleDatetimeSubtraction = 521, RuleDatetimeSubtractionParameters = 522, 
-    RuleDatetimeValueExpression1 = 523, RuleDatetimeValueExpression2 = 524, 
-    RuleDurationValueFunction = 525, RuleDurationFunction = 526, RuleDurationFunctionParameters = 527, 
-    RuleObjectName = 528, RuleObjectNameOrBindingVariable = 529, RuleDirectoryName = 530, 
-    RuleSchemaName = 531, RuleGraphName = 532, RuleDelimitedGraphName = 533, 
-    RuleGraphTypeName = 534, RuleNodeTypeName = 535, RuleEdgeTypeName = 536, 
-    RuleBindingTableName = 537, RuleDelimitedBindingTableName = 538, RuleProcedureName = 539, 
-    RuleLabelName = 540, RulePropertyName = 541, RuleFieldName = 542, RuleElementVariable = 543, 
-    RulePathVariable = 544, RuleSubpathVariable = 545, RuleBindingVariable = 546, 
-    RuleUnsignedLiteral = 547, RuleGeneralLiteral = 548, RuleTemporalLiteral = 549, 
-    RuleDateLiteral = 550, RuleTimeLiteral = 551, RuleDatetimeLiteral = 552, 
-    RuleListLiteral = 553, RuleRecordLiteral = 554, RuleIdentifier = 555, 
-    RuleRegularIdentifier = 556, RuleTimeZoneString = 557, RuleCharacterStringLiteral = 558, 
-    RuleUnsignedNumericLiteral = 559, RuleExactNumericLiteral = 560, RuleApproximateNumericLiteral = 561, 
-    RuleUnsignedInteger = 562, RuleUnsignedDecimalInteger = 563, RuleNullLiteral = 564, 
-    RuleDateString = 565, RuleTimeString = 566, RuleDatetimeString = 567, 
-    RuleDurationLiteral = 568, RuleDurationString = 569, RuleNodeSynonym = 570, 
-    RuleEdgesSynonym = 571, RuleEdgeSynonym = 572, RuleNonReservedWords = 573
+    RuleValueExpressionPrimary = 421, RuleLlmFunction = 422, RuleLlmModelName = 423, 
+    RuleParenthesizedValueExpression = 424, RuleNonParenthesizedValueExpressionPrimary = 425, 
+    RuleNonParenthesizedValueExpressionPrimarySpecialCase = 426, RuleUnsignedValueSpecification = 427, 
+    RuleNonNegativeIntegerSpecification = 428, RuleGeneralValueSpecification = 429, 
+    RuleDynamicParameterSpecification = 430, RuleLetValueExpression = 431, 
+    RuleValueQueryExpression = 432, RuleCaseExpression = 433, RuleCaseAbbreviation = 434, 
+    RuleCaseSpecification = 435, RuleSimpleCase = 436, RuleSearchedCase = 437, 
+    RuleSimpleWhenClause = 438, RuleSearchedWhenClause = 439, RuleElseClause = 440, 
+    RuleCaseOperand = 441, RuleWhenOperandList = 442, RuleWhenOperand = 443, 
+    RuleResult = 444, RuleResultExpression = 445, RuleCastSpecification = 446, 
+    RuleCastOperand = 447, RuleCastTarget = 448, RuleAggregateFunction = 449, 
+    RuleGeneralSetFunction = 450, RuleBinarySetFunction = 451, RuleGeneralSetFunctionType = 452, 
+    RuleSetQuantifier = 453, RuleBinarySetFunctionType = 454, RuleDependentValueExpression = 455, 
+    RuleIndependentValueExpression = 456, RuleElement_idFunction = 457, 
+    RuleBindingVariableReference = 458, RulePathValueExpression = 459, RulePathValueConstructor = 460, 
+    RulePathValueConstructorByEnumeration = 461, RulePathElementList = 462, 
+    RulePathElementListStart = 463, RulePathElementListStep = 464, RuleListValueExpression = 465, 
+    RuleListValueFunction = 466, RuleTrimListFunction = 467, RuleElementsFunction = 468, 
+    RuleListValueConstructor = 469, RuleListValueConstructorByEnumeration = 470, 
+    RuleListElementList = 471, RuleListElement = 472, RuleRecordConstructor = 473, 
+    RuleFieldsSpecification = 474, RuleFieldList = 475, RuleField = 476, 
+    RuleTruthValue = 477, RuleNumericValueExpression = 478, RuleNumericValueFunction = 479, 
+    RuleLengthExpression = 480, RuleCardinalityExpression = 481, RuleCardinalityExpressionArgument = 482, 
+    RuleCharLengthExpression = 483, RuleByteLengthExpression = 484, RulePathLengthExpression = 485, 
+    RuleAbsoluteValueExpression = 486, RuleModulusExpression = 487, RuleNumericValueExpressionDividend = 488, 
+    RuleNumericValueExpressionDivisor = 489, RuleTrigonometricFunction = 490, 
+    RuleTrigonometricFunctionName = 491, RuleGeneralLogarithmFunction = 492, 
+    RuleGeneralLogarithmBase = 493, RuleGeneralLogarithmArgument = 494, 
+    RuleCommonLogarithm = 495, RuleNaturalLogarithm = 496, RuleExponentialFunction = 497, 
+    RulePowerFunction = 498, RuleNumericValueExpressionBase = 499, RuleNumericValueExpressionExponent = 500, 
+    RuleSquareRoot = 501, RuleFloorFunction = 502, RuleCeilingFunction = 503, 
+    RuleCharacterStringValueExpression = 504, RuleByteStringValueExpression = 505, 
+    RuleTrimOperands = 506, RuleTrimCharacterOrByteStringSource = 507, RuleTrimSpecification = 508, 
+    RuleTrimCharacterOrByteString = 509, RuleNormalForm = 510, RuleStringLength = 511, 
+    RuleDatetimeValueExpression = 512, RuleDatetimeValueFunction = 513, 
+    RuleDateFunction = 514, RuleTimeFunction = 515, RuleLocaltimeFunction = 516, 
+    RuleDatetimeFunction = 517, RuleLocaldatetimeFunction = 518, RuleDateFunctionParameters = 519, 
+    RuleTimeFunctionParameters = 520, RuleDatetimeFunctionParameters = 521, 
+    RuleDurationValueExpression = 522, RuleDatetimeSubtraction = 523, RuleDatetimeSubtractionParameters = 524, 
+    RuleDatetimeValueExpression1 = 525, RuleDatetimeValueExpression2 = 526, 
+    RuleDurationValueFunction = 527, RuleDurationFunction = 528, RuleDurationFunctionParameters = 529, 
+    RuleObjectName = 530, RuleObjectNameOrBindingVariable = 531, RuleDirectoryName = 532, 
+    RuleSchemaName = 533, RuleGraphName = 534, RuleDelimitedGraphName = 535, 
+    RuleGraphTypeName = 536, RuleNodeTypeName = 537, RuleEdgeTypeName = 538, 
+    RuleBindingTableName = 539, RuleDelimitedBindingTableName = 540, RuleProcedureName = 541, 
+    RuleLabelName = 542, RulePropertyName = 543, RuleFieldName = 544, RuleElementVariable = 545, 
+    RulePathVariable = 546, RuleSubpathVariable = 547, RuleBindingVariable = 548, 
+    RuleUnsignedLiteral = 549, RuleGeneralLiteral = 550, RuleTemporalLiteral = 551, 
+    RuleDateLiteral = 552, RuleTimeLiteral = 553, RuleDatetimeLiteral = 554, 
+    RuleListLiteral = 555, RuleRecordLiteral = 556, RuleIdentifier = 557, 
+    RuleRegularIdentifier = 558, RuleTimeZoneString = 559, RuleCharacterStringLiteral = 560, 
+    RuleUnsignedNumericLiteral = 561, RuleExactNumericLiteral = 562, RuleApproximateNumericLiteral = 563, 
+    RuleUnsignedInteger = 564, RuleUnsignedDecimalInteger = 565, RuleNullLiteral = 566, 
+    RuleDateString = 567, RuleTimeString = 568, RuleDatetimeString = 569, 
+    RuleDurationLiteral = 570, RuleDurationString = 571, RuleNodeSynonym = 572, 
+    RuleEdgesSynonym = 573, RuleEdgeSynonym = 574, RuleNonReservedWords = 575
   };
 
   explicit GQLParser(antlr4::TokenStream *input);
@@ -756,6 +758,8 @@ public:
   class EdgeReferenceValueExpressionContext;
   class AggregatingValueExpressionContext;
   class ValueExpressionPrimaryContext;
+  class LlmFunctionContext;
+  class LlmModelNameContext;
   class ParenthesizedValueExpressionContext;
   class NonParenthesizedValueExpressionPrimaryContext;
   class NonParenthesizedValueExpressionPrimarySpecialCaseContext;
@@ -7792,6 +7796,7 @@ public:
     CastSpecificationContext *castSpecification();
     Element_idFunctionContext *element_idFunction();
     LetValueExpressionContext *letValueExpression();
+    LlmFunctionContext *llmFunction();
     BindingVariableReferenceContext *bindingVariableReference();
     ValueExpressionPrimaryContext *valueExpressionPrimary();
     antlr4::tree::TerminalNode *PERIOD();
@@ -7804,6 +7809,38 @@ public:
 
   ValueExpressionPrimaryContext* valueExpressionPrimary();
   ValueExpressionPrimaryContext* valueExpressionPrimary(int precedence);
+  class  LlmFunctionContext : public antlr4::ParserRuleContext {
+  public:
+    LlmFunctionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    antlr4::tree::TerminalNode *LLM();
+    CharacterStringLiteralContext *characterStringLiteral();
+    antlr4::tree::TerminalNode *AGG();
+    LlmModelNameContext *llmModelName();
+    antlr4::tree::TerminalNode *PROMPT();
+    antlr4::tree::TerminalNode *LEFT_PAREN();
+    antlr4::tree::TerminalNode *RIGHT_PAREN();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  LlmFunctionContext* llmFunction();
+
+  class  LlmModelNameContext : public antlr4::ParserRuleContext {
+  public:
+    LlmModelNameContext(antlr4::ParserRuleContext *parent, size_t invokingState);
+    virtual size_t getRuleIndex() const override;
+    IdentifierContext *identifier();
+
+
+    virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;
+   
+  };
+
+  LlmModelNameContext* llmModelName();
+
   class  ParenthesizedValueExpressionContext : public antlr4::ParserRuleContext {
   public:
     ParenthesizedValueExpressionContext(antlr4::ParserRuleContext *parent, size_t invokingState);
@@ -10114,6 +10151,9 @@ public:
     antlr4::tree::TerminalNode *WITHOUT();
     antlr4::tree::TerminalNode *WRITE();
     antlr4::tree::TerminalNode *ZONE();
+    antlr4::tree::TerminalNode *AGG();
+    antlr4::tree::TerminalNode *LLM();
+    antlr4::tree::TerminalNode *PROMPT();
 
 
     virtual std::any accept(antlr4::tree::ParseTreeVisitor *visitor) override;

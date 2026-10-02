@@ -306,6 +306,7 @@ static idx_t AccessExpressionEnd(const GqlExpressionProgram &program, idx_t node
 	case GqlExpressionType::BINARY:
 		return AccessExpressionEnd(program, AccessExpressionEnd(program, cursor));
 	case GqlExpressionType::FUNCTION:
+	case GqlExpressionType::LLM:
 		for (idx_t child = 0; child < program.child_counts[node]; child++) {
 			cursor = AccessExpressionEnd(program, cursor);
 		}

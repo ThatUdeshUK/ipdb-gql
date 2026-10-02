@@ -2231,7 +2231,18 @@ valueExpressionPrimary
     | castSpecification
     | element_idFunction
     | letValueExpression
+    | llmFunction
     | bindingVariableReference
+    ;
+
+// iPDB extension: LLM [<model>] PROMPT '<prompt>' and AGG LLM [<model>] (PROMPT '<prompt>').
+llmFunction
+    : AGG? LLM (llmModelName PROMPT)? characterStringLiteral
+    | AGG? LLM llmModelName? LEFT_PAREN PROMPT characterStringLiteral RIGHT_PAREN
+    ;
+
+llmModelName
+    : identifier
     ;
 
 parenthesizedValueExpression
@@ -3106,6 +3117,9 @@ nonReservedWords
     | WITHOUT
     | WRITE
     | ZONE
+    | AGG
+    | LLM
+    | PROMPT
     ;
 
 BOOLEAN_LITERAL
@@ -3582,6 +3596,11 @@ WALK: 'WALK';
 WITHOUT: 'WITHOUT';
 WRITE: 'WRITE';
 ZONE: 'ZONE';
+
+// iPDB extension words (nonreserved)
+AGG: 'AGG';
+LLM: 'LLM';
+PROMPT: 'PROMPT';
 
 fragment SEPARATED_IDENTIFIER
     : DELIMITED_IDENTIFIER

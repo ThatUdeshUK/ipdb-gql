@@ -88,7 +88,8 @@ enum class GqlExpressionType : uint8_t {
 	IS_NULL,
 	LABELED,
 	LIST_CONSTRUCTOR,
-	RECORD_CONSTRUCTOR
+	RECORD_CONSTRUCTOR,
+	LLM
 };
 
 enum class GqlUnaryOperator : uint8_t { PLUS, MINUS, NOT };

@@ -1,5 +1,7 @@
 #include "gql_transformer.hpp"
 
+#include "gql_llm.hpp"
+
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 
@@ -1644,6 +1646,9 @@ bool GqlTransformer::TransformExpressionPrimary(GQLParser::ValueExpressionPrimar
 	if (auto aggregate = context.aggregateFunction()) {
 		return TransformAggregate(*aggregate, result);
 	}
+	if (auto llm = context.llmFunction()) {
+		return TransformLlmFunction(*llm, result);
+	}
 	if (auto case_expression = context.caseExpression()) {
 		auto abbreviation = case_expression->caseAbbreviation();
 		if (!abbreviation || !abbreviation->COALESCE()) {
@@ -1789,6 +1794,42 @@ bool GqlTransformer::TransformAggregate(GQLParser::AggregateFunctionContext &con
 		return false;
 	}
 	expression->arguments.push_back(std::move(argument));
+	result = std::move(expression);
+	return true;
+}
+
+bool GqlTransformer::TransformLlmFunction(GQLParser::LlmFunctionContext &context,
+                                          shared_ptr<GqlExpression> &result) {
+	auto expression = make_shared_ptr<GqlExpression>();
+	expression->type = GqlExpressionType::LLM;
+	expression->aggregate = context.AGG() != nullptr;
+	expression->source = SourceRange(context);
+	if (auto model = context.llmModelName()) {
+		expression->function_name = TransformIdentifier(*model->identifier()).value;
+	}
+	auto prompt = context.characterStringLiteral();
+	expression->literal.type = GqlLiteralType::STRING;
+	expression->literal.value = UnquoteString(prompt->getText());
+	expression->literal.source = SourceRange(*prompt);
+
+	for (const auto &input : GqlLlmInputs(expression->literal.value)) {
+		auto variable = make_shared_ptr<GqlExpression>();
+		variable->type = GqlExpressionType::VARIABLE_REFERENCE;
+		variable->variable.value = StringUtil::Lower(input.variable);
+		variable->variable.source = expression->literal.source;
+		variable->source = expression->literal.source;
+		if (input.property.empty()) {
+			expression->arguments.push_back(std::move(variable));
+			continue;
+		}
+		auto property = make_shared_ptr<GqlExpression>();
+		property->type = GqlExpressionType::PROPERTY_REFERENCE;
+		property->left = std::move(variable);
+		property->property.value = StringUtil::Lower(input.property);
+		property->property.source = expression->literal.source;
+		property->source = expression->literal.source;
+		expression->arguments.push_back(std::move(property));
+	}
 	result = std::move(expression);
 	return true;
 }

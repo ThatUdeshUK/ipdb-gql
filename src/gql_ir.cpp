@@ -115,12 +115,14 @@ static void SerializeNode(const GqlBoundExpression &expression, GqlExpressionPro
 	case GqlExpressionType::PROPERTY_REFERENCE:
 	case GqlExpressionType::ELEMENT_ID:
 	case GqlExpressionType::FUNCTION:
+	case GqlExpressionType::LLM:
 		break;
 	}
 	program.operators.push_back(operation);
 	program.values.push_back(expression.expression_type == GqlExpressionType::FUNCTION ? expression.function_name
 	                                                                                   : expression.literal.value);
-	program.properties.push_back(expression.property);
+	program.properties.push_back(expression.expression_type == GqlExpressionType::LLM ? expression.function_name
+	                                                                                  : expression.property);
 	program.child_counts.push_back(NumericCast<uint8_t>(expression.arguments.size()));
 	program.aggregate.push_back(expression.aggregate);
 	program.distinct.push_back(expression.distinct);

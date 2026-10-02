@@ -1,5 +1,5 @@
 
-// Generated from third_party/opengql/GQL.g4 by ANTLR 4.13.2
+// Generated from /home/udeshuk/Developer/duckdb-gql/third_party/opengql/GQL.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -1844,6 +1844,14 @@ public:
   }
 
   virtual std::any visitValueExpressionPrimary(GQLParser::ValueExpressionPrimaryContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitLlmFunction(GQLParser::LlmFunctionContext *ctx) override {
+    return visitChildren(ctx);
+  }
+
+  virtual std::any visitLlmModelName(GQLParser::LlmModelNameContext *ctx) override {
     return visitChildren(ctx);
   }
 

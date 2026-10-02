@@ -1,5 +1,5 @@
 
-// Generated from third_party/opengql/GQL.g4 by ANTLR 4.13.2
+// Generated from /home/udeshuk/Developer/duckdb-gql/third_party/opengql/GQL.g4 by ANTLR 4.13.2
 
 #pragma once
 
@@ -934,6 +934,10 @@ public:
     virtual std::any visitAggregatingValueExpression(GQLParser::AggregatingValueExpressionContext *context) = 0;
 
     virtual std::any visitValueExpressionPrimary(GQLParser::ValueExpressionPrimaryContext *context) = 0;
+
+    virtual std::any visitLlmFunction(GQLParser::LlmFunctionContext *context) = 0;
+
+    virtual std::any visitLlmModelName(GQLParser::LlmModelNameContext *context) = 0;
 
     virtual std::any visitParenthesizedValueExpression(GQLParser::ParenthesizedValueExpressionContext *context) = 0;
 

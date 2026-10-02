@@ -1,6 +1,7 @@
 #include "gql_binder.hpp"
 
 #include "gql_algorithms.hpp"
+#include "gql_llm.hpp"
 #include "gql_optimizer.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -461,6 +462,44 @@ shared_ptr<GqlBoundExpression> GqlBinder::BindExpression(const GqlExpression &ex
 		result->binding_index = result->left->binding_index;
 		result->result_type = {GqlTypeId::BOOLEAN, false};
 		return result;
+	case GqlExpressionType::LLM: {
+		auto inputs = GqlLlmInputs(expression.literal.value);
+		if (inputs.size() != expression.arguments.size()) {
+			throw InternalException("GQL LLM prompt inputs do not match its arguments");
+		}
+		if (expression.aggregate && inputs.size() != 1) {
+			throw BinderException("GQL AGG LLM prompt must reference exactly one input, such as {{n.name}}");
+		}
+		for (idx_t index = 0; index < expression.arguments.size(); index++) {
+			auto bound = BindExpression(*expression.arguments[index]);
+			if (ContainsAggregate(*bound)) {
+				throw BinderException("GQL LLM prompt input '{{%s}}' cannot contain an aggregate", inputs[index].name);
+			}
+			if (!IsScalar(bound->result_type.id)) {
+				throw BinderException("GQL LLM prompt input '{{%s}}' must be a scalar value, such as a property",
+				                      inputs[index].name);
+			}
+			result->arguments.push_back(std::move(bound));
+		}
+		auto outputs = GqlLlmOutputs(expression.literal.value);
+		if (outputs.size() != 1) {
+			throw BinderException("GQL LLM prompt must declare exactly one output, such as {answer VARCHAR}");
+		}
+		auto &type = outputs[0].type;
+		if (type == "VARCHAR") {
+			result->result_type = {GqlTypeId::STRING, true};
+		} else if (type == "INTEGER") {
+			result->result_type = {GqlTypeId::INTEGER, true};
+		} else if (type == "BOOLEAN" || type == "BOOL") {
+			result->result_type = {GqlTypeId::BOOLEAN, true};
+		} else if (type == "DOUBLE") {
+			result->result_type = {GqlTypeId::DOUBLE, true};
+		} else {
+			throw BinderException("GQL LLM output type '%s' must be one of INTEGER, VARCHAR, BOOLEAN, BOOL or DOUBLE",
+			                      type);
+		}
+		return result;
+	}
 	}
 	throw InternalException("Unknown GQL expression type");
 }

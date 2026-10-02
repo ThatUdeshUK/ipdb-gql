@@ -58,6 +58,7 @@ private:
 	                                shared_ptr<GqlExpression> &result);
 	bool TransformNumericFunction(GQLParser::NumericValueFunctionContext &context, shared_ptr<GqlExpression> &result);
 	bool TransformAggregate(GQLParser::AggregateFunctionContext &context, shared_ptr<GqlExpression> &result);
+	bool TransformLlmFunction(GQLParser::LlmFunctionContext &context, shared_ptr<GqlExpression> &result);
 	bool TransformUnsignedLiteral(GQLParser::UnsignedLiteralContext &context, GqlLiteral &result);
 	bool TransformLiteral(GQLParser::ValueExpressionContext &context, GqlLiteral &result);
 

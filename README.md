@@ -37,16 +37,10 @@ storage and execution engine, plus an explicit CSR layer for graph algorithms.
 
 ## Install
 
-DuckGQL is available from DuckDB Community Extensions:
-
-```sql
-INSTALL duckgql FROM community;
-LOAD duckgql;
-```
-
 ## Build from source
 
-DuckGQL currently targets DuckDB `v1.5.5` and uses ANTLR `4.13.2`.
+This extension builds against [iPDB](https://github.com/purduedb/iPDb), a DuckDB `v1.5.5`
+fork checked out as the `duckdb/` submodule, and uses ANTLR `4.13.2`.
 
 Prerequisites:
 
@@ -55,52 +49,43 @@ Prerequisites:
 - A C++17 compiler
 - Python 3
 - Make
+- Ninja
 
 Clone the repository with its submodules and build a release binary:
 
 ```sh
-git clone --recurse-submodules https://github.com/rahul-iyer/duckdb-gql.git
-cd duckdb-gql
+git clone --recurse-submodules https://github.com/ThatUdeshUK/ipdb-gql.git
+cd ipdb-gql
 
-make setup-vcpkg
-VCPKG_TOOLCHAIN_PATH="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" make release
+make release
 ```
+
+The Makefile enables the build settings iPDB needs by default:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `GEN` | `ninja` | Passes `-G Ninja` to CMake |
+| `VCPKG_TOOLCHAIN_PATH` | `$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake` | Passes `-DCMAKE_TOOLCHAIN_FILE`, `-DVCPKG_BUILD=1` and `-DVCPKG_MANIFEST_DIR=$PWD`; the repo-local vcpkg is cloned and bootstrapped on first build |
+| `IPDB_FLAGS` | `-DENABLE_PREDICT=1 -DENABLE_LLM_API=1` | Enables iPDB's ML operator and LLM API support |
+
+`-DDUCKDB_EXTENSION_CONFIGS` always points at `extension_config.cmake`. Override any
+setting on the command line or in the environment, for example
+`VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake make release`
+to reuse an existing vcpkg, or `make release IPDB_FLAGS=` to build without the iPDB
+options. Extra CMake flags can still be added with `EXT_FLAGS`.
 
 The build produces:
 
 ```text
-build/release/duckdb
+build/release/ipdb
 build/release/extension/duckgql/duckgql.duckdb_extension
 ```
 
-The locally built DuckDB shell has DuckGQL preloaded:
+The locally built shell has DuckGQL preloaded:
 
 ```sh
-./build/release/duckdb
+./build/release/ipdb
 ```
-
-## Prebuilt artifacts
-
-The GitHub Actions distribution workflow builds platform-specific extension
-artifacts. DuckDB extensions are tied to both a DuckDB version and a target
-platform, so download the artifact matching DuckDB `v1.5.5` and your operating
-system architecture.
-
-Development artifacts are unsigned. Start a matching DuckDB CLI with unsigned
-extensions enabled:
-
-```sh
-duckdb -unsigned
-```
-
-Then load the downloaded binary:
-
-```sql
-LOAD '/absolute/path/to/duckgql.duckdb_extension';
-```
-
-Only load native extension binaries from a source you trust. For normal use,
-prefer installing the signed Community Extensions build above.
 
 ## Quick start
 
@@ -265,6 +250,32 @@ EXPLAIN CALL algo.pagerank('social')
 YIELD vertex_id, rank
 RETURN vertex_id, rank;
 ```
+
+## LLM expressions (iPDB)
+
+When built against [iPDB](https://ipdb-docs.pages.dev/reference/sql/),
+iPDB's LLM clauses can be used as GQL value expressions in `WHERE`, `FILTER`
+and `RETURN`:
+
+```sql
+CREATE LLM MODEL o4mini PATH 'o4-mini' ON PROMPT API 'https://api.openai.com/v1/' SECRET openai_key;
+
+MATCH (p:Person)-[:WROTE]->(r:Review)
+WHERE LLM o4mini PROMPT 'is the {sentiment VARCHAR} of {{r.text}} positive or negative' = 'negative'
+RETURN p.name, LLM o4mini PROMPT 'is {{p.name}} a {famous BOOLEAN} author' AS famous;
+
+MATCH (p:Person)
+RETURN AGG LLM o4mini (PROMPT 'summarize the {summary VARCHAR} of {{p.bio}}') AS summary;
+```
+
+- `LLM [model] PROMPT '...'` and `LLM [model] (PROMPT '...')` are scalar; omitting
+  the model lets iPDB select one.
+- `{{variable.property}}` and `{{variable}}` placeholders become prompt inputs. They
+  are bound like ordinary GQL references, so they can name properties of any MATCH
+  binding or LET values.
+- The prompt must declare exactly one output, `{name TYPE}` with TYPE one of
+  `INTEGER`, `VARCHAR`, `BOOLEAN`/`BOOL` or `DOUBLE`, which is the expression's type.
+- `AGG LLM` is an aggregate (allowed in `RETURN`, not `WHERE`) over exactly one input.
 
 ## Graph algorithms
 
@@ -571,7 +582,7 @@ python3 scripts/gql_conformance/check_gql_conformance.py --release
 Build and run the active SQLLogicTest suite:
 
 ```sh
-VCPKG_TOOLCHAIN_PATH="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" make debug
+make debug
 ./build/debug/test/unittest "test/sql/gql*"
 ```
 
